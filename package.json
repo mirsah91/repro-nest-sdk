@@ -1,0 +1,36 @@
+{
+  "name": "repro-nest",
+  "version": "0.0.1",
+  "description": "Repro Nest SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "express": "^5.1.0",
+    "mongoose": ">=6"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@babel/generator": "^7.28.3",
+    "@babel/parser": "^7.28.4",
+    "@babel/traverse": "^7.28.4",
+    "@babel/types": "^7.28.4",
+    "pirates": "^4.0.7",
+    "@babel/core": "^7.28.4",
+    "@babel/plugin-transform-typescript": "^7.28.0",
+    "express": "^5.1.0",
+    "mongoose": "^8.18.2"
+  }
+}
