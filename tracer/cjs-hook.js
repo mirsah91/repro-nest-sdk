@@ -54,7 +54,15 @@ function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
         for (const k of Object.getOwnPropertyNames(value)) {
             const d = Object.getOwnPropertyDescriptor(value, k);
             if (!d) continue;
-            tagExports(d.value, filename, seen, depth + 1);
+            if ('value' in d) tagExports(d.value, filename, seen, depth + 1);
+
+            if (typeof d.get === 'function') {
+                tagExports(d.get, filename, seen, depth + 1);
+                try { tagExports(value[k], filename, seen, depth + 1); } catch {}
+            }
+            if (typeof d.set === 'function') {
+                tagExports(d.set, filename, seen, depth + 1);
+            }
         }
     }
 }
