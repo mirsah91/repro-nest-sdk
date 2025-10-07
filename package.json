@@ -30,8 +30,9 @@
     "@babel/traverse": "^7.28.4",
     "@babel/types": "^7.28.4",
     "express": "^5.1.0",
+    "mongoose": "^8.18.2",
+    "@jridgewell/trace-mapping": "^0.3.25",
     "import-in-the-middle": "^1.14.4",
-    "mongoose": ">=6",
     "pirates": "^4.0.7",
     "require-in-the-middle": "^8.0.0",
     "shimmer": "^1.2.1"

@@ -6,6 +6,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             allowFns = [],                // regexes or strings
             wrapGettersSetters = false,   // skip noisy accessors by default
             skipAnonymous = false,        // don't wrap anon fns in node_modules
+            mapOriginalPosition = null,
         } = opts;
 
         const allowFnRegexes = allowFns.map(p =>
@@ -67,8 +68,13 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const name = nameFor(path);
             if (!shouldWrap(path, name)) return;
 
-            const line = n.loc?.start?.line ?? null;
-            const file = filenameForMeta;
+            const loc = n.loc?.start || null;
+            const mapped = loc && typeof mapOriginalPosition === 'function'
+                ? mapOriginalPosition(loc.line ?? null, loc.column ?? 0)
+                : null;
+
+            const file = mapped?.file || filenameForMeta;
+            const line = mapped?.line ?? loc?.line ?? null;
 
             let body = n.body;
             if (t.isArrowFunctionExpression(n) && !t.isBlockStatement(body)) {
@@ -107,8 +113,16 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             if (t.isImport(n.callee)) return;
             if (n.optional === true) return;
 
-            const fileLit = t.stringLiteral(state.file.opts.filename || '');
-            const lineLit = t.numericLiteral(n.loc?.start?.line ?? 0);
+            const loc = n.loc?.start || null;
+            const mapped = loc && typeof mapOriginalPosition === 'function'
+                ? mapOriginalPosition(loc.line ?? null, loc.column ?? 0)
+                : null;
+
+            const file = mapped?.file || filenameForMeta || state.file.opts.filename || '';
+            const line = mapped?.line ?? loc?.line ?? 0;
+
+            const fileLit = t.stringLiteral(file ?? '');
+            const lineLit = t.numericLiteral(line ?? 0);
 
             // Default: no thisArg, label from identifier name if any
             let labelLit = t.stringLiteral('');

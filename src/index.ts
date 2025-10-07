@@ -99,22 +99,16 @@ let __TRACER_READY = false;
 //         // include ONLY app code (no node_modules) to avoid interfering with deps
 //         const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
 //
-//         // additionally exclude common model/schema folders to be extra safe
-//         const extraExcludes = [
-//             '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
-//         ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
-//
 //         // exclude this SDK itself (and any babel internals if present)
 //         const exclude = [
 //             new RegExp('^' + escapeRx(sdkRoot) + '/'),
 //             /node_modules[\\/]@babel[\\/].*/,
-//             ...extraExcludes,
 //         ];
 //
 //         tracerPkg.init?.({
 //             instrument: true,               // tracer can instrument app code
 //             include,
-//             exclude,                        // but never our SDK or common data/model paths
+//             exclude,                        // but never our SDK
 //             mode: process.env.TRACE_MODE || 'v8',
 //             samplingMs: 10,
 //         });
@@ -149,10 +143,7 @@ function defaultTracerInitOpts(): TracerInitOpts {
     const escapeRx = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
     const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
-    const extraExcludes = [
-        '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
-    ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
-
+    // Only skip our own files and Babel internals; repository/service layers stay instrumented.
     const exclude = [
         new RegExp('^' + escapeRx(sdkRoot) + '/'), // never instrument the SDK itself
         /node_modules[\\/]@babel[\\/].*/,
