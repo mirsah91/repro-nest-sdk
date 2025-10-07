@@ -102,7 +102,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             if (n.__repro_call_wrapped) return;
 
             // Skip our helper, super(), import(), optional calls for now
-            if (t.isIdentifier(n.callee, { name: '__repro_call' })) return;
+            if (t.isIdentifier(n.callee, { name: '__repro_call' })) return; // guard: don't wrap helper
             if (t.isSuper(n.callee)) return;
             if (t.isImport(n.callee)) return;
             if (n.optional === true) return;

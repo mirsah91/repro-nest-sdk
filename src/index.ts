@@ -156,7 +156,6 @@ function defaultTracerInitOpts(): TracerInitOpts {
     const exclude = [
         new RegExp('^' + escapeRx(sdkRoot) + '/'), // never instrument the SDK itself
         /node_modules[\\/]@babel[\\/].*/,
-        ...extraExcludes,
     ];
 
     return {
