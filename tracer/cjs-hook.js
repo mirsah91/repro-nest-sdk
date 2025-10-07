@@ -1,11 +1,8 @@
 // cjs-hook.js
 const fs = require('node:fs');
 const Module = require('node:module');
+const path = require('node:path');
 const babel = require('@babel/core');
-const tsPlugin =
-    require('@babel/plugin-transform-typescript').default ||
-    require('@babel/plugin-transform-typescript');
-
 const makeWrap = require('./wrap-plugin');
 const { SYM_SRC_FILE, SYM_IS_APP } = require('./runtime');
 
@@ -16,6 +13,10 @@ const escapeRx = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 function isAppFile(filename) {
     const f = String(filename || '').replace(/\\/g, '/');
     return f.startsWith(CWD + '/') && !f.includes('/node_modules/');
+}
+
+function toPosix(file) {
+    return String(file || '').replace(/\\/g, '/');
 }
 
 function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
@@ -54,7 +55,16 @@ function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
         for (const k of Object.getOwnPropertyNames(value)) {
             const d = Object.getOwnPropertyDescriptor(value, k);
             if (!d) continue;
-            tagExports(d.value, filename, seen, depth + 1);
+
+            if ('value' in d) tagExports(d.value, filename, seen, depth + 1);
+
+            if (typeof d.get === 'function') {
+                tagExports(d.get, filename, seen, depth + 1);
+                try { tagExports(value[k], filename, seen, depth + 1); } catch {}
+            }
+            if (typeof d.set === 'function') {
+                tagExports(d.set, filename, seen, depth + 1);
+            }
         }
     }
 }
@@ -76,8 +86,10 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
     const origCompile = Module.prototype._compile;
     Module.prototype._compile = function patchedCompile(code, filename) {
         let out = code;
+        let metaFilename = filename;
         try {
             if (shouldHandle(filename) && isAppFile(filename)) {
+                metaFilename = getOriginalSourceFilename(code, filename) || filename;
                 // Transform the already-compiled JS (keeps Nest’s decorator metadata intact)
                 const res = babel.transformSync(code, {
                     filename,
@@ -95,7 +107,7 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
                     },
                     // only the wrap plugin; do NOT run TS transform here
                     plugins: [
-                        [ makeWrap(filename, { mode: 'all', wrapGettersSetters: false, skipAnonymous: false }) ],
+                        [ makeWrap(metaFilename, { mode: 'all', wrapGettersSetters: false, skipAnonymous: false }) ],
                     ],
                     compact: false,
                     comments: true,
@@ -109,7 +121,7 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
         const ret = origCompile.call(this, out, filename);
 
         // Tag exports for origin detection
-        try { tagExports(this.exports, filename); } catch {}
+        try { tagExports(this.exports, metaFilename); } catch {}
 
         return ret;
     };
@@ -126,6 +138,80 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
         try { tagExports(exp, filename); } catch {}
         return exp;
     };
+}
+
+function getOriginalSourceFilename(code, filename) {
+    try {
+        const map = loadSourceMap(code, filename);
+        if (!map) return null;
+
+        const { sources = [], sourceRoot } = map;
+        if (!sources.length) return null;
+
+        const resolvedSourceRoot = sourceRoot
+            ? resolveSourcePath(sourceRoot, map.__mapFile || filename)
+            : '';
+
+        for (const src of sources) {
+            if (!src) continue;
+            const abs = resolveSourcePath(src, map.__mapFile || filename, resolvedSourceRoot);
+            if (!abs) continue;
+            return toPosix(abs);
+        }
+    } catch {}
+    return null;
+}
+
+function resolveSourcePath(sourcePath, relativeTo, rootOverride) {
+    try {
+        const baseDir = path.dirname(relativeTo);
+        const combined = rootOverride
+            ? path.resolve(rootOverride, sourcePath)
+            : path.resolve(baseDir, sourcePath);
+        return combined;
+    } catch {
+        return null;
+    }
+}
+
+function loadSourceMap(code, filename) {
+    const match = /\/\/[#@]\s*sourceMappingURL=([^\s]+)/.exec(code);
+    if (!match) return null;
+
+    const url = match[1].trim();
+    if (!url) return null;
+
+    if (url.startsWith('data:')) {
+        return parseDataUrl(url);
+    }
+
+    const mapPath = path.resolve(path.dirname(filename), url);
+    try {
+        const text = fs.readFileSync(mapPath, 'utf8');
+        const json = JSON.parse(text);
+        Object.defineProperty(json, '__mapFile', { value: mapPath });
+        return json;
+    } catch {
+        return null;
+    }
+}
+
+function parseDataUrl(url) {
+    const comma = url.indexOf(',');
+    if (comma < 0) return null;
+
+    const meta = url.slice(5, comma);
+    const data = url.slice(comma + 1);
+
+    try {
+        if (/;base64/i.test(meta)) {
+            const buf = Buffer.from(data, 'base64');
+            return JSON.parse(buf.toString('utf8'));
+        }
+        return JSON.parse(decodeURIComponent(data));
+    } catch {
+        return null;
+    }
 }
 
 module.exports = { installCJS };
