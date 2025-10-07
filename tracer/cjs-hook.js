@@ -1,12 +1,10 @@
 // cjs-hook.js
 const fs = require('node:fs');
 const Module = require('node:module');
+const path = require('node:path');
 const babel = require('@babel/core');
-const tsPlugin =
-    require('@babel/plugin-transform-typescript').default ||
-    require('@babel/plugin-transform-typescript');
-
 const makeWrap = require('./wrap-plugin');
+const { TraceMap, originalPositionFor } = require('@jridgewell/trace-mapping');
 const { SYM_SRC_FILE, SYM_IS_APP } = require('./runtime');
 
 const CWD = process.cwd().replace(/\\/g, '/');
@@ -16,6 +14,10 @@ const escapeRx = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 function isAppFile(filename) {
     const f = String(filename || '').replace(/\\/g, '/');
     return f.startsWith(CWD + '/') && !f.includes('/node_modules/');
+}
+
+function toPosix(file) {
+    return String(file || '').replace(/\\/g, '/');
 }
 
 function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
@@ -84,8 +86,17 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
     const origCompile = Module.prototype._compile;
     Module.prototype._compile = function patchedCompile(code, filename) {
         let out = code;
+        let metaFilename = filename;
+        let mapOriginalPosition = null;
         try {
             if (shouldHandle(filename) && isAppFile(filename)) {
+                const sourceInfo = getSourceInfo(code, filename);
+                if (sourceInfo?.metaFilename) {
+                    metaFilename = sourceInfo.metaFilename;
+                }
+                if (typeof sourceInfo?.mapOriginalPosition === 'function') {
+                    mapOriginalPosition = sourceInfo.mapOriginalPosition;
+                }
                 // Transform the already-compiled JS (keeps Nest’s decorator metadata intact)
                 const res = babel.transformSync(code, {
                     filename,
@@ -103,7 +114,12 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
                     },
                     // only the wrap plugin; do NOT run TS transform here
                     plugins: [
-                        [ makeWrap(filename, { mode: 'all', wrapGettersSetters: false, skipAnonymous: false }) ],
+                        [ makeWrap(metaFilename, {
+                            mode: 'all',
+                            wrapGettersSetters: false,
+                            skipAnonymous: false,
+                            mapOriginalPosition,
+                        }) ],
                     ],
                     compact: false,
                     comments: true,
@@ -117,7 +133,7 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
         const ret = origCompile.call(this, out, filename);
 
         // Tag exports for origin detection
-        try { tagExports(this.exports, filename); } catch {}
+        try { tagExports(this.exports, metaFilename); } catch {}
 
         return ret;
     };
@@ -134,6 +150,115 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
         try { tagExports(exp, filename); } catch {}
         return exp;
     };
+}
+
+function getSourceInfo(code, filename) {
+    try {
+        const map = loadSourceMap(code, filename);
+        if (!map) return null;
+
+        const mapFile = map.__mapFile || filename;
+        const { sources = [], sourceRoot } = map;
+        const resolvedSourceRoot = sourceRoot
+            ? resolveSourcePath(sourceRoot, mapFile)
+            : '';
+
+        let metaFilename = null;
+        for (const src of sources) {
+            if (!src) continue;
+            const abs = resolveSourcePath(src, mapFile, resolvedSourceRoot);
+            if (!abs) continue;
+            metaFilename = toPosix(abs);
+            break;
+        }
+
+        const mapper = makeOriginalPositionMapper(map, mapFile, resolvedSourceRoot);
+
+        return {
+            metaFilename,
+            mapOriginalPosition: mapper,
+        };
+    } catch {}
+    return null;
+}
+
+function makeOriginalPositionMapper(map, mapFile, resolvedSourceRoot) {
+    try {
+        const traceMap = new TraceMap(map);
+        return (line, column = 0) => {
+            if (line == null) return null;
+            try {
+                const original = originalPositionFor(traceMap, { line, column });
+                if (!original || original.line == null) return null;
+
+                const file = original.source
+                    ? toPosix(resolveSourcePath(original.source, mapFile, resolvedSourceRoot))
+                    : null;
+
+                return {
+                    line: original.line,
+                    column: original.column ?? 0,
+                    file,
+                };
+            } catch {
+                return null;
+            }
+        };
+    } catch {
+        return null;
+    }
+}
+
+function resolveSourcePath(sourcePath, relativeTo, rootOverride) {
+    try {
+        const baseDir = path.dirname(relativeTo);
+        const combined = rootOverride
+            ? path.resolve(rootOverride, sourcePath)
+            : path.resolve(baseDir, sourcePath);
+        return combined;
+    } catch {
+        return null;
+    }
+}
+
+function loadSourceMap(code, filename) {
+    const match = /\/\/[#@]\s*sourceMappingURL=([^\s]+)/.exec(code);
+    if (!match) return null;
+
+    const url = match[1].trim();
+    if (!url) return null;
+
+    if (url.startsWith('data:')) {
+        return parseDataUrl(url);
+    }
+
+    const mapPath = path.resolve(path.dirname(filename), url);
+    try {
+        const text = fs.readFileSync(mapPath, 'utf8');
+        const json = JSON.parse(text);
+        Object.defineProperty(json, '__mapFile', { value: mapPath });
+        return json;
+    } catch {
+        return null;
+    }
+}
+
+function parseDataUrl(url) {
+    const comma = url.indexOf(',');
+    if (comma < 0) return null;
+
+    const meta = url.slice(5, comma);
+    const data = url.slice(comma + 1);
+
+    try {
+        if (/;base64/i.test(meta)) {
+            const buf = Buffer.from(data, 'base64');
+            return JSON.parse(buf.toString('utf8'));
+        }
+        return JSON.parse(decodeURIComponent(data));
+    } catch {
+        return null;
+    }
 }
 
 module.exports = { installCJS };
