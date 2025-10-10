@@ -56,7 +56,8 @@ const trace = {
             depth: ctx.depth || 0,
             returnValue: detail?.returnValue,
             threw: detail?.threw === true,
-            error: detail?.error
+            error: detail?.error,
+            args: detail?.args
         });
         ctx.depth = Math.max(0, (ctx.depth || 1) - 1);
     }
@@ -202,7 +203,7 @@ if (!global.__repro_call) {
                 try {
                     const out = fn.apply(thisArg, args);
 
-                    const exitDetailBase = { returnValue: out };
+                    const exitDetailBase = { returnValue: out, args };
 
                     // --- classify the return value ---
                     const isThenable = out && typeof out.then === 'function';
@@ -256,7 +257,7 @@ if (!global.__repro_call) {
                     trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
                     return out;
                 } catch (e) {
-                    trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e });
+                    trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
                     throw e;
                 }
             } catch {
