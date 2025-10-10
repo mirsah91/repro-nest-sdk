@@ -110,7 +110,18 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                     t.arrayExpression([]),
                     argsArray
                 )
-                : t.arrayExpression([]);
+                : t.arrayExpression(
+                    n.params.map(param => {
+                        if (t.isIdentifier(param)) return t.cloneNode(param, true);
+                        if (t.isRestElement(param) && t.isIdentifier(param.argument)) {
+                            return t.cloneNode(param.argument, true);
+                        }
+                        if (t.isAssignmentPattern(param) && t.isIdentifier(param.left)) {
+                            return t.cloneNode(param.left, true);
+                        }
+                        return t.identifier('undefined');
+                    })
+                );
 
             const argsDecl = t.variableDeclaration('const', [
                 t.variableDeclarator(argsId, argsInit)
