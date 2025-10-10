@@ -6,6 +6,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             allowFns = [],                // regexes or strings
             wrapGettersSetters = false,   // skip noisy accessors by default
             skipAnonymous = false,        // don't wrap anon fns in node_modules
+            mapOriginalPosition = null,
         } = opts;
 
         const allowFnRegexes = allowFns.map(p =>
@@ -15,11 +16,18 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
         function escapeRx(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
         const obj = kv => t.objectExpression(
-            Object.entries(kv).filter(([,v])=>v!=null)
-                .map(([k,v]) => t.objectProperty(
-                    t.identifier(k),
-                    typeof v === 'string' ? t.stringLiteral(v) : t.numericLiteral(v)
-                ))
+            Object.entries(kv)
+                .filter(([, v]) => v != null)
+                .map(([k, v]) => {
+                    let valueNode;
+                    if (typeof v === 'string') valueNode = t.stringLiteral(v);
+                    else if (typeof v === 'number') valueNode = t.numericLiteral(v);
+                    else if (typeof v === 'boolean') valueNode = t.booleanLiteral(v);
+                    else if (v && typeof v === 'object' && v.type) valueNode = v;
+                    else if (v === null) valueNode = t.nullLiteral();
+                    else throw new Error(`Unsupported object literal value for key ${k}`);
+                    return t.objectProperty(t.identifier(k), valueNode);
+                })
         );
 
         function nameFor(path){
@@ -67,31 +75,107 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const name = nameFor(path);
             if (!shouldWrap(path, name)) return;
 
-            const line = n.loc?.start?.line ?? null;
-            const file = filenameForMeta;
+            const loc = n.loc?.start || null;
+            const mapped = loc && typeof mapOriginalPosition === 'function'
+                ? mapOriginalPosition(loc.line ?? null, loc.column ?? 0)
+                : null;
 
-            let body = n.body;
-            if (t.isArrowFunctionExpression(n) && !t.isBlockStatement(body)) {
-                body = t.blockStatement([ t.returnStatement(body) ]);
+            const file = mapped?.file || filenameForMeta;
+            const line = mapped?.line ?? loc?.line ?? null;
+
+            if (t.isArrowFunctionExpression(n) && !t.isBlockStatement(n.body)) {
+                const bodyExprPath = path.get('body');
+                const origBody = t.cloneNode(bodyExprPath.node, true);
+                bodyExprPath.replaceWith(t.blockStatement([ t.returnStatement(origBody) ]));
             }
-            if (!t.isBlockStatement(body)) return;
+
+            const bodyPath = path.get('body');
+            if (!bodyPath.isBlockStatement()) return;
+            const body = bodyPath.node;
+
+            const argsId = path.scope.generateUidIdentifier('args');
+            const resultId = path.scope.generateUidIdentifier('result');
+            const errorId = path.scope.generateUidIdentifier('error');
+            const threwId = path.scope.generateUidIdentifier('threw');
+
+            const typeofArgs = t.unaryExpression('typeof', t.identifier('arguments'));
+            const arrayProto = t.memberExpression(t.identifier('Array'), t.identifier('prototype'));
+            const arraySlice = t.memberExpression(arrayProto, t.identifier('slice'));
+            const sliceCall = t.memberExpression(arraySlice, t.identifier('call'));
+            const argsArray = t.callExpression(sliceCall, [ t.identifier('arguments') ]);
+            const canUseArguments = !path.isArrowFunctionExpression();
+            const argsInit = canUseArguments
+                ? t.conditionalExpression(
+                    t.binaryExpression('===', typeofArgs, t.stringLiteral('undefined')),
+                    t.arrayExpression([]),
+                    argsArray
+                )
+                : t.arrayExpression([]);
+
+            const argsDecl = t.variableDeclaration('const', [
+                t.variableDeclarator(argsId, argsInit)
+            ]);
+
+            const localsDecl = t.variableDeclaration('let', [
+                t.variableDeclarator(resultId, t.identifier('undefined')),
+                t.variableDeclarator(errorId, t.nullLiteral()),
+                t.variableDeclarator(threwId, t.booleanLiteral(false))
+            ]);
 
             const enter = t.expressionStatement(
                 t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
-                    [ t.stringLiteral(name), obj({ file, line }) ]
-                )
-            );
-            const exit = t.expressionStatement(
-                t.callExpression(
-                    t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
-                    [ obj({ fn: name, file, line }) ]
+                    [ t.stringLiteral(name), obj({ file, line }), obj({ args: argsId }) ]
                 )
             );
 
-            const wrapped = t.blockStatement([ enter, t.tryStatement(body, null, t.blockStatement([ exit ])) ]);
+            const exit = t.expressionStatement(
+                t.callExpression(
+                    t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
+                    [
+                        obj({ fn: name, file, line }),
+                        obj({ returnValue: resultId, error: errorId, threw: threwId })
+                    ]
+                )
+            );
+
+            const errId = path.scope.generateUidIdentifier('err');
+            bodyPath.traverse({
+                ReturnStatement(retPath) {
+                    if (retPath.node.__repro_wrapped) return;
+                    if (retPath.getFunctionParent() !== path) return;
+                    const arg = retPath.node.argument
+                        ? t.cloneNode(retPath.node.argument, true)
+                        : t.identifier('undefined');
+                    const seq = t.sequenceExpression([
+                        t.assignmentExpression('=', resultId, arg),
+                        resultId
+                    ]);
+                    const newReturn = t.returnStatement(seq);
+                    newReturn.__repro_wrapped = true;
+                    retPath.replaceWith(newReturn);
+                }
+            });
+
+            const wrappedTry = t.tryStatement(
+                body,
+                t.catchClause(errId, t.blockStatement([
+                    t.expressionStatement(
+                        t.assignmentExpression('=', threwId, t.booleanLiteral(true))
+                    ),
+                    t.expressionStatement(
+                        t.assignmentExpression('=', errorId, errId)
+                    ),
+                    t.throwStatement(errId)
+                ])),
+                t.blockStatement([ exit ])
+            );
+
+            const prologue = [ argsDecl, localsDecl, enter ];
+            const wrapped = t.blockStatement([ ...prologue, wrappedTry ]);
+
             if (path.isFunction() || path.isClassMethod() || path.isObjectMethod()) {
-                path.get('body').replaceWith(wrapped);
+                bodyPath.replaceWith(wrapped);
             }
             n.__wrapped = true;
         }
@@ -107,8 +191,16 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             if (t.isImport(n.callee)) return;
             if (n.optional === true) return;
 
-            const fileLit = t.stringLiteral(state.file.opts.filename || '');
-            const lineLit = t.numericLiteral(n.loc?.start?.line ?? 0);
+            const loc = n.loc?.start || null;
+            const mapped = loc && typeof mapOriginalPosition === 'function'
+                ? mapOriginalPosition(loc.line ?? null, loc.column ?? 0)
+                : null;
+
+            const file = mapped?.file || filenameForMeta || state.file.opts.filename || '';
+            const line = mapped?.line ?? loc?.line ?? 0;
+
+            const fileLit = t.stringLiteral(file ?? '');
+            const lineLit = t.numericLiteral(line ?? 0);
 
             // Default: no thisArg, label from identifier name if any
             let labelLit = t.stringLiteral('');
@@ -132,7 +224,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 }
 
                 const fnMember = t.memberExpression(objId, prop, computed);
-                const argsArray = t.arrayExpression(n.arguments); // preserves spreads
+                const argsArray = t.arrayExpression(n.arguments.map(arg => t.cloneNode(arg, true)));
 
                 const reproCall = t.callExpression(
                     t.identifier('__repro_call'),
@@ -156,7 +248,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 // Evaluate callee ONCE into a temp as well (avoids re-evaluation when nested).
                 const fnOrig = n.callee;
                 const fnId = path.scope.generateUidIdentifier('fn');
-                const argsArray = t.arrayExpression(n.arguments);
+                const argsArray = t.arrayExpression(n.arguments.map(arg => t.cloneNode(arg, true)));
 
                 if (t.isIdentifier(fnOrig)) {
                     labelLit = t.stringLiteral(fnOrig.name);
