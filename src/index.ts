@@ -313,7 +313,17 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         // ---- our ALS (unchanged) ----
         als.run({ sid, aid }, () => {
             // subscribe to tracer for this request (passive only)
-            const events: Array<{ t:number; type:'enter'|'exit'; fn?:string; file?:string; line?:number; depth?:number }> = [];
+            const events: Array<{
+                t: number;
+                type: 'enter' | 'exit';
+                fn?: string;
+                file?: string;
+                line?: number;
+                depth?: number;
+                args?: any;
+                returnValue?: any;
+                error?: any;
+            }> = [];
             let unsubscribe: undefined | (() => void);
 
             try {
@@ -325,7 +335,15 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                         unsubscribe = __TRACER__.tracer.on((ev: any) => {
                             if (ev && ev.traceId === tidNow) {
                                 events.push({
-                                    t: ev.t, type: ev.type, fn: ev.fn, file: ev.file, line: ev.line, depth: ev.depth
+                                    t: ev.t,
+                                    type: ev.type,
+                                    fn: ev.fn,
+                                    file: ev.file,
+                                    line: ev.line,
+                                    depth: ev.depth,
+                                    args: ev.args,
+                                    returnValue: ev.returnValue,
+                                    error: ev.error,
                                 });
                             }
                         });

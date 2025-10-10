@@ -6,6 +6,47 @@ const listeners = new Set();
 let EMITTING = false;
 const quiet = process.env.TRACE_QUIET === '1';
 
+function safeSerialize(value) {
+    if (value === undefined) return undefined;
+    if (typeof value === 'bigint') return value.toString();
+    if (typeof value === 'function') return `[Function: ${value.name || 'anonymous'}]`;
+    if (typeof value === 'symbol') return value.toString();
+    if (value instanceof Error) {
+        return { name: value.name, message: value.message, stack: value.stack };
+    }
+    if (value && typeof value === 'object') {
+        if (value instanceof Date) return value.toISOString();
+        if (typeof Buffer !== 'undefined' && Buffer.isBuffer && Buffer.isBuffer(value)) {
+            return { type: 'Buffer', data: value.toString('base64') };
+        }
+    }
+
+    try {
+        const seen = new WeakSet();
+        const str = JSON.stringify(value, (key, val) => {
+            if (typeof val === 'bigint') return val.toString();
+            if (typeof val === 'function') return `[Function: ${val.name || 'anonymous'}]`;
+            if (typeof val === 'symbol') return val.toString();
+            if (val instanceof Error) {
+                return { name: val.name, message: val.message, stack: val.stack };
+            }
+            if (val && typeof val === 'object') {
+                if (typeof Buffer !== 'undefined' && Buffer.isBuffer && Buffer.isBuffer(val)) {
+                    return { type: 'Buffer', data: val.toString('base64') };
+                }
+                if (seen.has(val)) return '[Circular]';
+                seen.add(val);
+            }
+            return val;
+        });
+        if (str === undefined) return undefined;
+        return JSON.parse(str);
+    } catch {
+        try { return typeof value === 'string' ? value : String(value); }
+        catch { return '[unserializable]'; }
+    }
+}
+
 // ---- console patch: trace console.* as top-level calls (safe; no recursion) ----
 let CONSOLE_PATCHED = false;
 function patchConsole() {
@@ -34,12 +75,12 @@ const trace = {
         const ctx = als.getStore() || {};
         ctx.depth = (ctx.depth || 0) + 1;
         emit({ type:'enter', t: Date.now(), fn, file: meta?.file, line: meta?.line,
-            traceId: ctx.traceId, depth: ctx.depth });
+            traceId: ctx.traceId, depth: ctx.depth, args: meta?.args });
     },
     exit(meta){
         const ctx = als.getStore() || {};
         emit({ type:'exit', t: Date.now(), fn: meta?.fn, file: meta?.file, line: meta?.line,
-            traceId: ctx.traceId, depth: ctx.depth || 0 });
+            traceId: ctx.traceId, depth: ctx.depth || 0, returnValue: meta?.returnValue, error: meta?.error });
         ctx.depth = Math.max(0, (ctx.depth || 1) - 1);
     }
 };
@@ -180,7 +221,11 @@ if (!global.__repro_call) {
                 const name = label || fn.name || '(anonymous)';
                 const meta = { file: callFile || null, line: callLine || null };
 
-                trace.enter(name, meta);
+                const serializedArgs = Array.isArray(args)
+                    ? args.map(a => safeSerialize(a))
+                    : undefined;
+
+                trace.enter(name, { ...meta, args: serializedArgs });
                 try {
                     const out = fn.apply(thisArg, args);
 
@@ -198,16 +243,13 @@ if (!global.__repro_call) {
 
                     if (isThenable) {
                         if (isNativePromise) {
-                            // Safe: attach side-effect, return the ORIGINAL promise
-                            if (typeof out.finally === 'function') {
-                                out.finally(() =>
-                                    trace.exit({ fn: name, file: meta.file, line: meta.line })
-                                );
-                                return out;
-                            }
-                            // Rare thenables that are actually native-ish but no .finally
-                            Promise.resolve(out).finally(() =>
-                                trace.exit({ fn: name, file: meta.file, line: meta.line })
+                            out.then(
+                                value => {
+                                    trace.exit({ fn: name, file: meta.file, line: meta.line, returnValue: safeSerialize(value) });
+                                },
+                                err => {
+                                    trace.exit({ fn: name, file: meta.file, line: meta.line, error: safeSerialize(err) });
+                                }
                             );
                             return out;
                         }
@@ -222,8 +264,13 @@ if (!global.__repro_call) {
                         // Generic unknown thenable: don't replace it.
                         // Try to piggyback without touching its identity; if that throws, at least we emitted enter.
                         try {
-                            Promise.resolve(out).finally(() =>
-                                trace.exit({ fn: name, file: meta.file, line: meta.line })
+                            Promise.resolve(out).then(
+                                value => {
+                                    trace.exit({ fn: name, file: meta.file, line: meta.line, returnValue: safeSerialize(value) });
+                                },
+                                err => {
+                                    trace.exit({ fn: name, file: meta.file, line: meta.line, error: safeSerialize(err) });
+                                }
                             );
                         } catch {
                             // fallback: immediate exit; better than leaking a span
@@ -233,10 +280,10 @@ if (!global.__repro_call) {
                     }
 
                     // Non-thenable: close span now
-                    trace.exit({ fn: name, file: meta.file, line: meta.line });
+                    trace.exit({ fn: name, file: meta.file, line: meta.line, returnValue: safeSerialize(out) });
                     return out;
                 } catch (e) {
-                    trace.exit({ fn: name, file: meta.file, line: meta.line });
+                    trace.exit({ fn: name, file: meta.file, line: meta.line, error: safeSerialize(e) });
                     throw e;
                 }
             } catch {
