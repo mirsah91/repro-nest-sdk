@@ -22,6 +22,33 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             return node;
         };
 
+        function describeExpression(node, depth = 0) {
+            if (!node || depth > 5) return '';
+            if (t.isIdentifier(node)) return node.name;
+            if (t.isThisExpression(node)) return 'this';
+            if (t.isSuper(node)) return 'super';
+            if (t.isStringLiteral(node)) return node.value;
+            if (t.isNumericLiteral(node)) return String(node.value);
+            if (t.isMemberExpression(node)) {
+                const obj = describeExpression(node.object, depth + 1) || '';
+                let prop = '';
+                if (!node.computed && t.isIdentifier(node.property)) {
+                    prop = node.property.name;
+                } else if (!node.computed && t.isStringLiteral(node.property)) {
+                    prop = node.property.value;
+                } else if (!node.computed && t.isNumericLiteral(node.property)) {
+                    prop = String(node.property.value);
+                } else {
+                    const inner = describeExpression(node.property, depth + 1) || '?';
+                    prop = node.computed ? `[${inner}]` : inner;
+                }
+                if (!obj) return prop || '';
+                if (prop.startsWith('[')) return `${obj}${prop}`;
+                return prop ? `${obj}.${prop}` : obj;
+            }
+            return '';
+        }
+
         const obj = kv => t.objectExpression(
             Object.entries(kv)
                 .filter(([, v]) => v != null)
@@ -227,7 +254,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const lineLit = t.numericLiteral(line ?? 0);
 
             // Default: no thisArg, label from identifier name if any
-            let labelLit = t.stringLiteral('');
+            let label = '';
             let callExpr;
 
             if (t.isMemberExpression(n.callee)) {
@@ -241,18 +268,14 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 const fnId  = path.scope.generateUidIdentifier('fn');
 
                 // label = property name when available
-                if (!computed && t.isIdentifier(prop)) {
-                    labelLit = t.stringLiteral(prop.name);
-                } else if (t.isStringLiteral(prop)) {
-                    labelLit = t.stringLiteral(prop.value);
-                }
+                label = describeExpression(n.callee) || label;
 
                 const fnMember = t.memberExpression(objId, prop, computed);
                 const argsArray = t.arrayExpression(n.arguments.map(arg => t.cloneNode(arg, true)));
 
                 const reproCall = t.callExpression(
                     t.identifier('__repro_call'),
-                    [ fnId, objId, argsArray, fileLit, lineLit, labelLit ]
+                    [ fnId, objId, argsArray, fileLit, lineLit, t.stringLiteral(label || '') ]
                 );
 
                 // Build a single expression that:
@@ -274,13 +297,11 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 const fnId = path.scope.generateUidIdentifier('fn');
                 const argsArray = t.arrayExpression(n.arguments.map(arg => t.cloneNode(arg, true)));
 
-                if (t.isIdentifier(fnOrig)) {
-                    labelLit = t.stringLiteral(fnOrig.name);
-                }
+                label = describeExpression(fnOrig) || label;
 
                 const reproCall = t.callExpression(
                     t.identifier('__repro_call'),
-                    [ fnId, t.nullLiteral(), argsArray, fileLit, lineLit, labelLit ]
+                    [ fnId, t.nullLiteral(), argsArray, fileLit, lineLit, t.stringLiteral(label || '') ]
                 );
 
                 callExpr = t.sequenceExpression([

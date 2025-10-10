@@ -27,6 +27,18 @@ function patchConsole() {
     }
 }
 
+function isThenable(value) {
+    return value != null && typeof value.then === 'function';
+}
+
+function isMongooseQuery(value) {
+    return (
+        isThenable(value) &&
+        typeof value.exec === 'function' &&
+        (value?.constructor?.name === 'Query' || value?.model != null)
+    );
+}
+
 const trace = {
     on(fn){ listeners.add(fn); return () => listeners.delete(fn); },
     withTrace(id, fn){ return als.run({ traceId: id, depth: 0 }, fn); },
@@ -46,20 +58,81 @@ const trace = {
     },
     exit(meta, detail){
         const ctx = als.getStore() || {};
-        emit({
-            type: 'exit',
-            t: Date.now(),
+        const depthAtExit = ctx.depth || 0;
+        const baseMeta = {
             fn: meta?.fn,
             file: meta?.file,
-            line: meta?.line,
-            traceId: ctx.traceId,
-            depth: ctx.depth || 0,
+            line: meta?.line
+        };
+        const baseDetail = {
+            args: detail?.args,
             returnValue: detail?.returnValue,
-            threw: detail?.threw === true,
             error: detail?.error,
-            args: detail?.args
-        });
-        ctx.depth = Math.max(0, (ctx.depth || 1) - 1);
+            threw: detail?.threw === true
+        };
+
+        const emitExit = (overrides = {}) => {
+            const finalDetail = {
+                returnValue: overrides.hasOwnProperty('returnValue')
+                    ? overrides.returnValue
+                    : baseDetail.returnValue,
+                threw: overrides.hasOwnProperty('threw')
+                    ? overrides.threw
+                    : baseDetail.threw,
+                error: overrides.hasOwnProperty('error')
+                    ? overrides.error
+                    : baseDetail.error,
+                args: overrides.hasOwnProperty('args')
+                    ? overrides.args
+                    : baseDetail.args
+            };
+
+            emit({
+                type: 'exit',
+                t: Date.now(),
+                fn: baseMeta.fn,
+                file: baseMeta.file,
+                line: baseMeta.line,
+                traceId: ctx.traceId,
+                depth: depthAtExit,
+                returnValue: finalDetail.returnValue,
+                threw: finalDetail.threw === true,
+                error: finalDetail.error,
+                args: finalDetail.args
+            });
+        };
+
+        ctx.depth = Math.max(0, depthAtExit - 1);
+
+        if (!baseDetail.threw) {
+            const rv = baseDetail.returnValue;
+            if (isThenable(rv)) {
+                if (isMongooseQuery(rv)) {
+                    emitExit();
+                    return;
+                }
+
+                let settled = false;
+                const finalize = (value, threw, error) => {
+                    if (settled) return value;
+                    settled = true;
+                    emitExit({ returnValue: value, threw, error });
+                    return value;
+                };
+
+                try {
+                    rv.then(
+                        value => finalize(value, false, null),
+                        err => finalize(undefined, true, err)
+                    );
+                } catch (err) {
+                    finalize(undefined, true, err);
+                }
+                return;
+            }
+        }
+
+        emitExit();
     }
 };
 global.__trace = trace; // called by injected code
@@ -196,8 +269,14 @@ if (!global.__repro_call) {
                 const isApp = fn[SYM_IS_APP] === true;
                 if (isApp) return fn.apply(thisArg, args);
 
-                const name = label || fn.name || '(anonymous)';
-                const meta = { file: callFile || null, line: callLine || null };
+                const name = (label && label.length) || fn.name
+                    ? (label && label.length ? label : fn.name)
+                    : '(anonymous)';
+                const sourceFile = fn[SYM_SRC_FILE];
+                const meta = {
+                    file: sourceFile || callFile || null,
+                    line: sourceFile ? null : (callLine || null)
+                };
 
                 trace.enter(name, meta, { args });
                 try {
@@ -206,49 +285,36 @@ if (!global.__repro_call) {
                     const exitDetailBase = { returnValue: out, args };
 
                     // --- classify the return value ---
-                    const isThenable = out && typeof out.then === 'function';
-                    const isNativePromise =
-                        typeof Promise !== 'undefined' &&
-                        (out instanceof Promise || out?.[Symbol.toStringTag] === 'Promise');
+                    const isThenableValue = isThenable(out);
+                    const isQuery = isMongooseQuery(out);
 
-                    // Heuristic: Mongoose Query (thenable that has .exec and ctor name 'Query')
-                    const isMongooseQuery =
-                        isThenable &&
-                        typeof out.exec === 'function' &&
-                        (out?.constructor?.name === 'Query' || out?.model != null);
-
-                    if (isThenable) {
-                        if (isNativePromise) {
-                            // Safe: attach side-effect, return the ORIGINAL promise
-                            if (typeof out.finally === 'function') {
-                                out.finally(() =>
-                                    trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase)
-                                );
-                                return out;
-                            }
-                            // Rare thenables that are actually native-ish but no .finally
-                            Promise.resolve(out).finally(() =>
-                                trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase)
-                            );
-                            return out;
-                        }
-
-                        if (isMongooseQuery) {
-                            // CRITICAL: do NOT attach handlers; they'd execute the query now.
-                            // Emit exit immediately and return the original thenable Query for chaining.
+                    if (isThenableValue) {
+                        if (isQuery) {
                             trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
                             return out;
                         }
 
-                        // Generic unknown thenable: don't replace it.
-                        // Try to piggyback without touching its identity; if that throws, at least we emitted enter.
+                        let settled = false;
+                        const finalize = (value, threw, error) => {
+                            if (settled) return value;
+                            settled = true;
+                            const detail = {
+                                returnValue: value,
+                                args,
+                                threw,
+                                error
+                            };
+                            trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
+                            return value;
+                        };
+
                         try {
-                            Promise.resolve(out).finally(() =>
-                                trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase)
+                            out.then(
+                                value => finalize(value, false, null),
+                                err => finalize(undefined, true, err)
                             );
-                        } catch {
-                            // fallback: immediate exit; better than leaking a span
-                            trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
+                        } catch (err) {
+                            finalize(undefined, true, err);
                         }
                         return out;
                     }
