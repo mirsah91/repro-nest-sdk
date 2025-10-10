@@ -68,6 +68,16 @@ function patchConsole() {
     }
 }
 
+function serializeArgs(args) {
+    if (!Array.isArray(args)) return undefined;
+    return args.map(arg => safeSerialize(arg));
+}
+
+function serializeValue(value) {
+    if (value === undefined) return undefined;
+    return safeSerialize(value);
+}
+
 const trace = {
     on(fn){ listeners.add(fn); return () => listeners.delete(fn); },
     withTrace(id, fn){ return als.run({ traceId: id, depth: 0 }, fn); },
@@ -75,15 +85,22 @@ const trace = {
         const ctx = als.getStore() || {};
         ctx.depth = (ctx.depth || 0) + 1;
         emit({ type:'enter', t: Date.now(), fn, file: meta?.file, line: meta?.line,
-            traceId: ctx.traceId, depth: ctx.depth, args: meta?.args });
+            traceId: ctx.traceId, depth: ctx.depth, args: serializeArgs(meta?.args) });
     },
     exit(meta){
         const ctx = als.getStore() || {};
         emit({ type:'exit', t: Date.now(), fn: meta?.fn, file: meta?.file, line: meta?.line,
-            traceId: ctx.traceId, depth: ctx.depth || 0, returnValue: meta?.returnValue, error: meta?.error });
+            traceId: ctx.traceId, depth: ctx.depth || 0,
+            returnValue: serializeValue(meta?.returnValue), error: serializeValue(meta?.error) });
         ctx.depth = Math.max(0, (ctx.depth || 1) - 1);
     }
 };
+try {
+    trace.enter[SYM_SKIP_WRAP] = true;
+    trace.exit[SYM_SKIP_WRAP] = true;
+    trace.on[SYM_SKIP_WRAP] = true;
+    trace.withTrace[SYM_SKIP_WRAP] = true;
+} catch {}
 global.__trace = trace; // called by injected code
 
 // ===== Symbols used by the loader to tag function origins =====

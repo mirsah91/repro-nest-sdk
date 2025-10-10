@@ -15,12 +15,10 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
         function escapeRx(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-        const obj = kv => t.objectExpression(
-            Object.entries(kv).filter(([,v])=>v!=null)
-                .map(([k,v]) => t.objectProperty(
-                    t.identifier(k),
-                    typeof v === 'string' ? t.stringLiteral(v) : t.numericLiteral(v)
-                ))
+        const makeMetaObject = (entries) => t.objectExpression(
+            entries
+                .filter(Boolean)
+                .map(([key, value]) => t.objectProperty(t.identifier(key), value))
         );
 
         function nameFor(path){
@@ -79,25 +77,126 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             let body = n.body;
             if (t.isArrowFunctionExpression(n) && !t.isBlockStatement(body)) {
                 body = t.blockStatement([ t.returnStatement(body) ]);
+                path.get('body').replaceWith(body);
             }
             if (!t.isBlockStatement(body)) return;
+
+            const argsId = path.scope.generateUidIdentifier('args');
+            const retId = path.scope.generateUidIdentifier('ret');
+            const hasRetId = path.scope.generateUidIdentifier('hasRet');
+            const errId = path.scope.generateUidIdentifier('err');
+            const hasErrId = path.scope.generateUidIdentifier('hasErr');
+            const caughtId = path.scope.generateUidIdentifier('caught');
+
+            const sliceCall = t.callExpression(
+                t.memberExpression(
+                    t.memberExpression(
+                        t.memberExpression(t.identifier('Array'), t.identifier('prototype')),
+                        t.identifier('slice')
+                    ),
+                    t.identifier('call')
+                ),
+                [ t.identifier('arguments') ]
+            );
+
+            const argsExpr = t.conditionalExpression(
+                t.binaryExpression('===',
+                    t.unaryExpression('typeof', t.identifier('arguments')),
+                    t.stringLiteral('undefined')
+                ),
+                t.identifier('undefined'),
+                sliceCall
+            );
+
+            const fileNode = file ? t.stringLiteral(file) : t.nullLiteral();
+            const lineNode = line != null ? t.numericLiteral(line) : t.nullLiteral();
+
+            const enterMeta = makeMetaObject([
+                ['file', fileNode],
+                ['line', lineNode],
+                ['args', argsId],
+            ]);
+
+            const exitMeta = makeMetaObject([
+                ['fn', t.stringLiteral(name)],
+                ['file', fileNode],
+                ['line', lineNode],
+                ['returnValue', t.conditionalExpression(hasRetId, retId, t.identifier('undefined'))],
+                ['error', t.conditionalExpression(hasErrId, errId, t.identifier('undefined'))],
+            ]);
 
             const enter = t.expressionStatement(
                 t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
-                    [ t.stringLiteral(name), obj({ file, line }) ]
-                )
-            );
-            const exit = t.expressionStatement(
-                t.callExpression(
-                    t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
-                    [ obj({ fn: name, file, line }) ]
+                    [ t.stringLiteral(name), enterMeta ]
                 )
             );
 
-            const wrapped = t.blockStatement([ enter, t.tryStatement(body, null, t.blockStatement([ exit ])) ]);
+            const exit = t.expressionStatement(
+                t.callExpression(
+                    t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
+                    [ exitMeta ]
+                )
+            );
+
+            const bodyPath = path.get('body');
+            bodyPath.traverse({
+                ReturnStatement(retPath) {
+                    if (retPath.getFunctionParent() !== path) return;
+                    const arg = retPath.node.argument;
+                    if (!arg) {
+                        retPath.replaceWith(
+                            t.blockStatement([
+                                t.expressionStatement(t.assignmentExpression('=', hasRetId, t.booleanLiteral(true))),
+                                t.expressionStatement(t.assignmentExpression('=', retId, t.identifier('undefined'))),
+                                t.returnStatement(),
+                            ])
+                        );
+                        return;
+                    }
+
+                    const clonedArg = t.cloneNode(arg);
+                    const valueExpr = path.node.async && !t.isAwaitExpression(clonedArg)
+                        ? t.awaitExpression(clonedArg)
+                        : clonedArg;
+                    const tempId = retPath.scope.generateUidIdentifier('ret');
+                    retPath.replaceWith(
+                        t.blockStatement([
+                            t.variableDeclaration('const', [ t.variableDeclarator(tempId, valueExpr) ]),
+                            t.expressionStatement(t.assignmentExpression('=', hasRetId, t.booleanLiteral(true))),
+                            t.expressionStatement(t.assignmentExpression('=', retId, tempId)),
+                            t.returnStatement(tempId),
+                        ])
+                    );
+                },
+                Function(inner) {
+                    inner.skip();
+                }
+            });
+
+            const tryBlock = t.blockStatement(body.body);
+            const catchBlock = t.catchClause(
+                caughtId,
+                t.blockStatement([
+                    t.expressionStatement(t.assignmentExpression('=', hasErrId, t.booleanLiteral(true))),
+                    t.expressionStatement(t.assignmentExpression('=', errId, caughtId)),
+                    t.throwStatement(caughtId),
+                ])
+            );
+            const finallyBlock = t.blockStatement([ exit ]);
+
+            const wrapped = t.blockStatement([
+                t.variableDeclaration('const', [ t.variableDeclarator(argsId, argsExpr) ]),
+                t.variableDeclaration('let', [ t.variableDeclarator(retId) ]),
+                t.variableDeclaration('let', [ t.variableDeclarator(hasRetId, t.booleanLiteral(false)) ]),
+                t.variableDeclaration('let', [ t.variableDeclarator(errId) ]),
+                t.variableDeclaration('let', [ t.variableDeclarator(hasErrId, t.booleanLiteral(false)) ]),
+                enter,
+                t.tryStatement(tryBlock, catchBlock, finallyBlock),
+            ]);
+
             if (path.isFunction() || path.isClassMethod() || path.isObjectMethod()) {
-                path.get('body').replaceWith(wrapped);
+                bodyPath.replaceWith(wrapped);
             }
             n.__wrapped = true;
         }
