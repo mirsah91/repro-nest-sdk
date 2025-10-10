@@ -56,6 +56,7 @@ function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
         for (const k of Object.getOwnPropertyNames(value)) {
             const d = Object.getOwnPropertyDescriptor(value, k);
             if (!d) continue;
+
             if ('value' in d) tagExports(d.value, filename, seen, depth + 1);
 
             if (typeof d.get === 'function') {
