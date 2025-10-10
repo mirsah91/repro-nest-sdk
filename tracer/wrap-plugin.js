@@ -15,6 +15,13 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
         function escapeRx(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+        const markInternal = (node) => {
+            if (node && typeof node === 'object') {
+                node.__repro_internal = true;
+            }
+            return node;
+        };
+
         const obj = kv => t.objectExpression(
             Object.entries(kv)
                 .filter(([, v]) => v != null)
@@ -102,7 +109,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const arrayProto = t.memberExpression(t.identifier('Array'), t.identifier('prototype'));
             const arraySlice = t.memberExpression(arrayProto, t.identifier('slice'));
             const sliceCall = t.memberExpression(arraySlice, t.identifier('call'));
-            const argsArray = t.callExpression(sliceCall, [ t.identifier('arguments') ]);
+            const argsArray = markInternal(t.callExpression(sliceCall, [ t.identifier('arguments') ]));
             const canUseArguments = !path.isArrowFunctionExpression();
             const argsInit = canUseArguments
                 ? t.conditionalExpression(
@@ -134,20 +141,20 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             ]);
 
             const enter = t.expressionStatement(
-                t.callExpression(
+                markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
                     [ t.stringLiteral(name), obj({ file, line }), obj({ args: argsId }) ]
-                )
+                ))
             );
 
             const exit = t.expressionStatement(
-                t.callExpression(
+                markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
                     [
                         obj({ fn: name, file, line }),
-                        obj({ returnValue: resultId, error: errorId, threw: threwId })
+                        obj({ returnValue: resultId, error: errorId, threw: threwId, args: argsId })
                     ]
-                )
+                ))
             );
 
             const errId = path.scope.generateUidIdentifier('err');
@@ -195,12 +202,18 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
         function wrapCall(path, state) {
             const { node: n } = path;
             if (n.__repro_call_wrapped) return;
+            if (n.__repro_internal) return;
 
             // Skip our helper, super(), import(), optional calls for now
             if (t.isIdentifier(n.callee, { name: '__repro_call' })) return;
             if (t.isSuper(n.callee)) return;
             if (t.isImport(n.callee)) return;
             if (n.optional === true) return;
+
+            if (t.isMemberExpression(n.callee) && t.isIdentifier(n.callee.object, { name: '__trace' })) {
+                return;
+            }
+            if (t.isIdentifier(n.callee, { name: '__trace' })) return;
 
             const loc = n.loc?.start || null;
             const mapped = loc && typeof mapOriginalPosition === 'function'
