@@ -83,6 +83,22 @@ type TracerApi = {
     patchHttp?: () => void; // optional in your tracer
 };
 
+type TraceRecord = { [key: string]: TraceValue };
+type TraceValue = null | string | number | boolean | TraceValue[] | TraceRecord;
+
+type TraceEvent = {
+    t: number;
+    type: 'enter' | 'exit';
+    fn?: string;
+    file?: string;
+    line?: number;
+    depth?: number;
+    args?: TraceValue[];
+    returnValue?: TraceValue;
+    threw?: boolean;
+    error?: TraceValue;
+};
+
 function escapeRx(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 let __TRACER__: TracerApi | null = null;
 let __TRACER_READY = false;
@@ -99,22 +115,16 @@ let __TRACER_READY = false;
 //         // include ONLY app code (no node_modules) to avoid interfering with deps
 //         const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
 //
-//         // additionally exclude common model/schema folders to be extra safe
-//         const extraExcludes = [
-//             '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
-//         ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
-//
 //         // exclude this SDK itself (and any babel internals if present)
 //         const exclude = [
 //             new RegExp('^' + escapeRx(sdkRoot) + '/'),
 //             /node_modules[\\/]@babel[\\/].*/,
-//             ...extraExcludes,
 //         ];
 //
 //         tracerPkg.init?.({
 //             instrument: true,               // tracer can instrument app code
 //             include,
-//             exclude,                        // but never our SDK or common data/model paths
+//             exclude,                        // but never our SDK
 //             mode: process.env.TRACE_MODE || 'v8',
 //             samplingMs: 10,
 //         });
@@ -149,14 +159,10 @@ function defaultTracerInitOpts(): TracerInitOpts {
     const escapeRx = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
     const include = [ new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)') ];
-    const extraExcludes = [
-        '/model/', '/models/', '/schema/', '/schemas/', '/db/', '/database/', '/mongo/', '/repositories?/'
-    ].map(seg => new RegExp(escapeRx(cwd) + '.*' + seg));
-
+    // Only skip our own files and Babel internals; repository/service layers stay instrumented.
     const exclude = [
         new RegExp('^' + escapeRx(sdkRoot) + '/'), // never instrument the SDK itself
         /node_modules[\\/]@babel[\\/].*/,
-        ...extraExcludes,
     ];
 
     return {
@@ -265,7 +271,7 @@ function normalizeRouteKey(method: string, rawPath: string) {
     return `${String(method || 'GET').toUpperCase()} ${base}`;
 }
 
-function coerceBodyToStorable(body: any, contentType?: string | number | string[]) {
+function coerceBodyToStorable(body: any, contentType?: string | string[]) {
     if (body && typeof body === 'object' && !Buffer.isBuffer(body)) return body;
 
     const ct = Array.isArray(contentType) ? String(contentType[0]) : String(contentType || '');
@@ -284,6 +290,225 @@ function coerceBodyToStorable(body: any, contentType?: string | number | string[
         if (typeof body === 'string') return body;
     }
     return body;
+}
+
+const MAX_TRACE_DEPTH = 3;
+const MAX_TRACE_ARRAY = 20;
+const MAX_TRACE_KEYS = 20;
+const MAX_TRACE_STRING = 200;
+const STACK_LINES = 5;
+
+function truncateString(value: string): string {
+    if (value.length <= MAX_TRACE_STRING) return value;
+    const omitted = value.length - MAX_TRACE_STRING;
+    return `${value.slice(0, MAX_TRACE_STRING)}…(+${omitted} chars)`;
+}
+
+function safeCtorName(value: unknown): string | undefined {
+    try {
+        const ctor = (value as any)?.constructor;
+        if (!ctor) return undefined;
+        const name = ctor.name;
+        return typeof name === 'string' && name.length ? name : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function snapshotTraceValue(value: any, depth = 0, seen?: WeakSet<object>): TraceValue {
+    const type = typeof value;
+
+    if (value == null) {
+        return value as TraceValue;
+    }
+
+    if (type === 'boolean') {
+        return value as TraceValue;
+    }
+
+    if (type === 'number') {
+        return Number.isFinite(value) ? (value as TraceValue) : { __type: 'number', value: String(value) };
+    }
+
+    if (type === 'string') {
+        return truncateString(value);
+    }
+
+    if (type === 'bigint') {
+        return { __type: 'bigint', value: value.toString() };
+    }
+
+    if (type === 'symbol') {
+        return { __type: 'symbol', value: String(value) };
+    }
+
+    if (type === 'function') {
+        return { __type: 'function', name: (value as Function).name || '(anonymous)' };
+    }
+
+    if (type === 'undefined') {
+        return { __type: 'undefined' };
+    }
+
+    if (value instanceof Date) {
+        const iso = Number.isFinite(value.getTime()) ? value.toISOString() : value.toString();
+        return { __type: 'date', value: iso };
+    }
+
+    if (value instanceof RegExp) {
+        return { __type: 'regexp', value: value.toString() };
+    }
+
+    if (Buffer.isBuffer(value)) {
+        return { __type: 'buffer', length: value.length };
+    }
+
+    if (value instanceof Error) {
+        const stack = typeof value.stack === 'string'
+            ? value.stack.split('\n').slice(0, STACK_LINES).join('\n')
+            : undefined;
+        const errRecord: TraceRecord = {
+            __type: 'error',
+            name: value.name,
+            message: value.message,
+        };
+        if (stack) errRecord.stack = stack;
+        const code = (value as any)?.code;
+        if (code != null) errRecord.code = snapshotTraceValue(code);
+        return errRecord;
+    }
+
+    if (value && typeof value === 'object') {
+        if (!seen) seen = new WeakSet<object>();
+
+        const obj = value as Record<string, any>;
+
+        if (seen.has(obj)) {
+            return { __type: 'circular' };
+        }
+
+        seen.add(obj);
+
+        if (depth >= MAX_TRACE_DEPTH) {
+            const summary: TraceRecord = { __type: 'object' };
+            const ctor = safeCtorName(obj);
+            if (ctor) summary.ctor = ctor;
+            return summary;
+        }
+
+        if (Array.isArray(obj)) {
+            const items: TraceValue[] = [];
+            const len = obj.length;
+            for (let i = 0; i < Math.min(len, MAX_TRACE_ARRAY); i++) {
+                items.push(snapshotTraceValue(obj[i], depth + 1, seen));
+            }
+            if (len > MAX_TRACE_ARRAY) {
+                items.push({ __type: 'truncated', count: len - MAX_TRACE_ARRAY });
+            }
+            return items;
+        }
+
+        if (typeof (obj as any).then === 'function') {
+            return { __type: 'thenable' };
+        }
+
+        if (obj instanceof Map) {
+            const entries: TraceValue[] = [];
+            let index = 0;
+            for (const [k, v] of obj.entries()) {
+                if (index >= MAX_TRACE_ARRAY) break;
+                entries.push([
+                    snapshotTraceValue(k, depth + 1, seen),
+                    snapshotTraceValue(v, depth + 1, seen),
+                ]);
+                index++;
+            }
+            if (obj.size > index) {
+                entries.push({ __type: 'truncated', count: obj.size - index });
+            }
+            return { __type: 'map', entries };
+        }
+
+        if (obj instanceof Set) {
+            const values: TraceValue[] = [];
+            let index = 0;
+            for (const v of obj.values()) {
+                if (index >= MAX_TRACE_ARRAY) break;
+                values.push(snapshotTraceValue(v, depth + 1, seen));
+                index++;
+            }
+            if (obj.size > index) {
+                values.push({ __type: 'truncated', count: obj.size - index });
+            }
+            return { __type: 'set', values };
+        }
+
+        const toJson = typeof (obj as any).toJSON === 'function' ? (obj as any).toJSON.bind(obj) : null;
+        if (toJson) {
+            try {
+                const json = toJson();
+                if (json !== obj) {
+                    return snapshotTraceValue(json, depth + 1, seen);
+                }
+            } catch {}
+        }
+
+        const toObject = typeof (obj as any).toObject === 'function' ? (obj as any).toObject.bind(obj) : null;
+        if (toObject) {
+            try {
+                const json = toObject();
+                if (json !== obj) {
+                    return snapshotTraceValue(json, depth + 1, seen);
+                }
+            } catch {}
+        }
+
+        const allKeys = (() => {
+            try { return Object.keys(obj); }
+            catch { return [] as string[]; }
+        })();
+
+        const result: TraceRecord = {};
+        const max = Math.min(allKeys.length, MAX_TRACE_KEYS);
+        for (let i = 0; i < max; i++) {
+            const key = allKeys[i];
+            try {
+                result[key] = snapshotTraceValue(obj[key], depth + 1, seen);
+            } catch {
+                result[key] = { __type: 'unavailable' };
+            }
+        }
+
+        if (allKeys.length > max) {
+            result.__truncated = { __type: 'truncated', count: allKeys.length - max };
+        }
+
+        const ctorName = safeCtorName(obj);
+        if (ctorName && ctorName !== 'Object') {
+            result.__ctor = ctorName;
+        }
+
+        return result;
+    }
+
+    try {
+        return { __type: type, value: String(value) };
+    } catch {
+        return { __type: type };
+    }
+}
+
+function snapshotTraceArgs(args: any): TraceValue[] | undefined {
+    if (!Array.isArray(args)) return undefined;
+    const out: TraceValue[] = [];
+    const len = args.length;
+    for (let i = 0; i < Math.min(len, MAX_TRACE_ARRAY); i++) {
+        out.push(snapshotTraceValue(args[i]));
+    }
+    if (len > MAX_TRACE_ARRAY) {
+        out.push({ __type: 'truncated', count: len - MAX_TRACE_ARRAY });
+    }
+    return out;
 }
 
 // ===================================================================
@@ -309,7 +534,11 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         const origSend = res.send.bind(res as any);
         (res as any).send = (body: any) => {
             if (capturedBody === undefined) {
-                capturedBody = coerceBodyToStorable(body, res.getHeader?.('content-type'));
+                const ctHeader = res.getHeader?.('content-type');
+                const normalizedCt = typeof ctHeader === 'number'
+                    ? String(ctHeader)
+                    : (ctHeader as string | string[] | undefined);
+                capturedBody = coerceBodyToStorable(body, normalizedCt);
             }
             return origSend(body);
         };
@@ -323,7 +552,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         // ---- our ALS (unchanged) ----
         als.run({ sid, aid }, () => {
             // subscribe to tracer for this request (passive only)
-            const events: Array<{ t:number; type:'enter'|'exit'; fn?:string; file?:string; line?:number; depth?:number }> = [];
+            const events: TraceEvent[] = [];
             let unsubscribe: undefined | (() => void);
 
             try {
@@ -334,9 +563,33 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     if (tidNow) {
                         unsubscribe = __TRACER__.tracer.on((ev: any) => {
                             if (ev && ev.traceId === tidNow) {
-                                events.push({
-                                    t: ev.t, type: ev.type, fn: ev.fn, file: ev.file, line: ev.line, depth: ev.depth
-                                });
+                                const event: TraceEvent = {
+                                    t: ev.t,
+                                    type: ev.type,
+                                    fn: ev.fn,
+                                    file: ev.file,
+                                    line: ev.line,
+                                    depth: ev.depth,
+                                };
+
+                                const serializedArgs = snapshotTraceArgs(ev.args);
+                                if (serializedArgs) {
+                                    event.args = serializedArgs;
+                                }
+
+                                if (Object.prototype.hasOwnProperty.call(ev, 'returnValue')) {
+                                    event.returnValue = snapshotTraceValue(ev.returnValue);
+                                }
+
+                                if (ev.threw === true) {
+                                    event.threw = true;
+                                }
+
+                                if (Object.prototype.hasOwnProperty.call(ev, 'error') && ev.error !== undefined) {
+                                    event.error = snapshotTraceValue(ev.error);
+                                }
+
+                                events.push(event);
                             }
                         });
                     }
@@ -348,7 +601,11 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     const buf = Buffer.isBuffer(chunks[0])
                         ? Buffer.concat(chunks.map(c => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))))
                         : Buffer.from(chunks.map(String).join(''));
-                    capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
+                    const ctHeader = res.getHeader?.('content-type');
+                    const normalizedCt = typeof ctHeader === 'number'
+                        ? String(ctHeader)
+                        : (ctHeader as string | string[] | undefined);
+                    capturedBody = coerceBodyToStorable(buf, normalizedCt);
                 }
 
                 let traceStr = '[]';

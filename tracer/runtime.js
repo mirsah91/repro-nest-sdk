@@ -30,16 +30,34 @@ function patchConsole() {
 const trace = {
     on(fn){ listeners.add(fn); return () => listeners.delete(fn); },
     withTrace(id, fn){ return als.run({ traceId: id, depth: 0 }, fn); },
-    enter(fn, meta){
+    enter(fn, meta, detail){
         const ctx = als.getStore() || {};
         ctx.depth = (ctx.depth || 0) + 1;
-        emit({ type:'enter', t: Date.now(), fn, file: meta?.file, line: meta?.line,
-            traceId: ctx.traceId, depth: ctx.depth });
+        emit({
+            type: 'enter',
+            t: Date.now(),
+            fn,
+            file: meta?.file,
+            line: meta?.line,
+            traceId: ctx.traceId,
+            depth: ctx.depth,
+            args: detail?.args
+        });
     },
-    exit(meta){
+    exit(meta, detail){
         const ctx = als.getStore() || {};
-        emit({ type:'exit', t: Date.now(), fn: meta?.fn, file: meta?.file, line: meta?.line,
-            traceId: ctx.traceId, depth: ctx.depth || 0 });
+        emit({
+            type: 'exit',
+            t: Date.now(),
+            fn: meta?.fn,
+            file: meta?.file,
+            line: meta?.line,
+            traceId: ctx.traceId,
+            depth: ctx.depth || 0,
+            returnValue: detail?.returnValue,
+            threw: detail?.threw === true,
+            error: detail?.error
+        });
         ctx.depth = Math.max(0, (ctx.depth || 1) - 1);
     }
 };
@@ -180,9 +198,11 @@ if (!global.__repro_call) {
                 const name = label || fn.name || '(anonymous)';
                 const meta = { file: callFile || null, line: callLine || null };
 
-                trace.enter(name, meta);
+                trace.enter(name, meta, { args });
                 try {
                     const out = fn.apply(thisArg, args);
+
+                    const exitDetailBase = { returnValue: out };
 
                     // --- classify the return value ---
                     const isThenable = out && typeof out.then === 'function';
@@ -201,13 +221,13 @@ if (!global.__repro_call) {
                             // Safe: attach side-effect, return the ORIGINAL promise
                             if (typeof out.finally === 'function') {
                                 out.finally(() =>
-                                    trace.exit({ fn: name, file: meta.file, line: meta.line })
+                                    trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase)
                                 );
                                 return out;
                             }
                             // Rare thenables that are actually native-ish but no .finally
                             Promise.resolve(out).finally(() =>
-                                trace.exit({ fn: name, file: meta.file, line: meta.line })
+                                trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase)
                             );
                             return out;
                         }
@@ -215,7 +235,7 @@ if (!global.__repro_call) {
                         if (isMongooseQuery) {
                             // CRITICAL: do NOT attach handlers; they'd execute the query now.
                             // Emit exit immediately and return the original thenable Query for chaining.
-                            trace.exit({ fn: name, file: meta.file, line: meta.line });
+                            trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
                             return out;
                         }
 
@@ -223,20 +243,20 @@ if (!global.__repro_call) {
                         // Try to piggyback without touching its identity; if that throws, at least we emitted enter.
                         try {
                             Promise.resolve(out).finally(() =>
-                                trace.exit({ fn: name, file: meta.file, line: meta.line })
+                                trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase)
                             );
                         } catch {
                             // fallback: immediate exit; better than leaking a span
-                            trace.exit({ fn: name, file: meta.file, line: meta.line });
+                            trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
                         }
                         return out;
                     }
 
                     // Non-thenable: close span now
-                    trace.exit({ fn: name, file: meta.file, line: meta.line });
+                    trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
                     return out;
                 } catch (e) {
-                    trace.exit({ fn: name, file: meta.file, line: meta.line });
+                    trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e });
                     throw e;
                 }
             } catch {
