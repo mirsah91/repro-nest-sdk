@@ -202,6 +202,13 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
         }
 
         // ---- NEW: wrap every call-site with __repro_call(...) ----
+        function isTraceHelperCall(node) {
+            if (!t.isMemberExpression(node?.callee)) return false;
+            const obj = node.callee.object;
+            if (t.isIdentifier(obj, { name: '__trace' })) return true;
+            return false;
+        }
+
         function wrapCall(path, state) {
             const { node: n } = path;
             if (n.__repro_call_wrapped) return;
@@ -211,6 +218,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             if (t.isSuper(n.callee)) return;
             if (t.isImport(n.callee)) return;
             if (n.optional === true) return;
+            if (isTraceHelperCall(n)) return;
 
             const loc = n.loc?.start || null;
             const mapped = loc && typeof mapOriginalPosition === 'function'
@@ -277,7 +285,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
                 const reproCall = t.callExpression(
                     t.identifier('__repro_call'),
-                    [ fnId, t.nullLiteral(), argsArray, fileLit, lineLit, labelLit ]
+                    [ fnId, t.unaryExpression('void', t.numericLiteral(0)), argsArray, fileLit, lineLit, labelLit ]
                 );
 
                 callExpr = t.sequenceExpression([

@@ -103,6 +103,13 @@ try {
 } catch {}
 global.__trace = trace; // called by injected code
 
+const SKIP_CALL_FNS = new WeakSet([
+    trace.enter,
+    trace.exit,
+    trace.on,
+    trace.withTrace,
+]);
+
 // ===== Symbols used by the loader to tag function origins =====
 const SYM_SRC_FILE = Symbol.for('__repro_src_file'); // function's defining file (set by require hook)
 const SYM_IS_APP   = Symbol.for('__repro_is_app');   // boolean: true if function is from app code
@@ -228,7 +235,7 @@ if (!global.__repro_call) {
     Object.defineProperty(global, '__repro_call', {
         value: function __repro_call(fn, thisArg, args, callFile, callLine, label) {
             try {
-                if (typeof fn !== 'function' || fn[SYM_SKIP_WRAP]) {
+                if (typeof fn !== 'function' || fn[SYM_SKIP_WRAP] || SKIP_CALL_FNS.has(fn)) {
                     return fn.apply(thisArg, args);
                 }
 
