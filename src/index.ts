@@ -276,6 +276,113 @@ function coerceBodyToStorable(body: any, contentType?: string | number | string[
     return body;
 }
 
+const TRACE_VALUE_MAX_DEPTH = 3;
+const TRACE_VALUE_MAX_KEYS = 20;
+const TRACE_VALUE_MAX_ITEMS = 20;
+const TRACE_VALUE_MAX_STRING = 2000;
+
+function sanitizeTraceValue(value: any, depth = 0, seen: WeakSet<object> = new WeakSet()): any {
+    if (value === null || value === undefined) return value;
+    const type = typeof value;
+
+    if (type === 'number' || type === 'boolean') return value;
+    if (type === 'string') {
+        if (value.length <= TRACE_VALUE_MAX_STRING) return value;
+        return `${value.slice(0, TRACE_VALUE_MAX_STRING)}…(${value.length - TRACE_VALUE_MAX_STRING} more chars)`;
+    }
+    if (type === 'bigint') return value.toString();
+    if (type === 'symbol') return value.toString();
+    if (type === 'function') return `[Function${value.name ? ` ${value.name}` : ''}]`;
+
+    if (Buffer.isBuffer(value)) {
+        return {
+            __type: 'Buffer',
+            length: value.length,
+            preview: value.length ? value.slice(0, 32).toString('hex') : '',
+        };
+    }
+
+    if (value instanceof Date) return value.toISOString();
+    if (value instanceof RegExp) return value.toString();
+    if (value instanceof Error) {
+        return {
+            name: value.name,
+            message: value.message,
+            stack: value.stack,
+        };
+    }
+
+    if (type !== 'object') return String(value);
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+
+    if (depth >= TRACE_VALUE_MAX_DEPTH) {
+        const ctor = value?.constructor?.name;
+        return ctor && ctor !== 'Object'
+            ? `[${ctor} depth>${TRACE_VALUE_MAX_DEPTH}]`
+            : `[Object depth>${TRACE_VALUE_MAX_DEPTH}]`;
+    }
+
+    if (Array.isArray(value)) {
+        const out = value.slice(0, TRACE_VALUE_MAX_ITEMS)
+            .map(item => sanitizeTraceValue(item, depth + 1, seen));
+        if (value.length > TRACE_VALUE_MAX_ITEMS) {
+            out.push(`…(${value.length - TRACE_VALUE_MAX_ITEMS} more items)`);
+        }
+        return out;
+    }
+
+    if (value instanceof Map) {
+        const entries: Array<[any, any]> = [];
+        for (const [k, v] of value) {
+            if (entries.length >= TRACE_VALUE_MAX_ITEMS) break;
+            entries.push([
+                sanitizeTraceValue(k, depth + 1, seen),
+                sanitizeTraceValue(v, depth + 1, seen)
+            ]);
+        }
+        if (value.size > TRACE_VALUE_MAX_ITEMS) {
+            entries.push([`…(${value.size - TRACE_VALUE_MAX_ITEMS} more entries)`, null]);
+        }
+        return { __type: 'Map', entries };
+    }
+
+    if (value instanceof Set) {
+        const arr: any[] = [];
+        for (const item of value) {
+            if (arr.length >= TRACE_VALUE_MAX_ITEMS) break;
+            arr.push(sanitizeTraceValue(item, depth + 1, seen));
+        }
+        if (value.size > TRACE_VALUE_MAX_ITEMS) {
+            arr.push(`…(${value.size - TRACE_VALUE_MAX_ITEMS} more items)`);
+        }
+        return { __type: 'Set', values: arr };
+    }
+
+    const ctor = value?.constructor?.name;
+    const result: Record<string, any> = {};
+    const keys = Object.keys(value);
+    for (const key of keys.slice(0, TRACE_VALUE_MAX_KEYS)) {
+        try {
+            result[key] = sanitizeTraceValue((value as any)[key], depth + 1, seen);
+        } catch (err) {
+            result[key] = `[Cannot serialize: ${(err as Error)?.message || 'unknown error'}]`;
+        }
+    }
+    if (keys.length > TRACE_VALUE_MAX_KEYS) {
+        result.__truncatedKeys = keys.length - TRACE_VALUE_MAX_KEYS;
+    }
+    if (ctor && ctor !== 'Object') {
+        result.__class = ctor;
+    }
+    return result;
+}
+
+function sanitizeTraceArgs(values: any): any {
+    if (!Array.isArray(values)) return values;
+    return values.map(v => sanitizeTraceValue(v));
+}
+
 // ===================================================================
 // reproMiddleware — unchanged behavior + passive per-request trace
 // ===================================================================
@@ -313,7 +420,18 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         // ---- our ALS (unchanged) ----
         als.run({ sid, aid }, () => {
             // subscribe to tracer for this request (passive only)
-            const events: Array<{ t:number; type:'enter'|'exit'; fn?:string; file?:string; line?:number; depth?:number }> = [];
+            const events: Array<{
+                t: number;
+                type: 'enter' | 'exit';
+                fn?: string;
+                file?: string;
+                line?: number | null;
+                depth?: number;
+                args?: any;
+                returnValue?: any;
+                threw?: boolean;
+                error?: any;
+            }> = [];
             let unsubscribe: undefined | (() => void);
 
             try {
@@ -324,9 +442,29 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     if (tidNow) {
                         unsubscribe = __TRACER__.tracer.on((ev: any) => {
                             if (ev && ev.traceId === tidNow) {
-                                events.push({
-                                    t: ev.t, type: ev.type, fn: ev.fn, file: ev.file, line: ev.line, depth: ev.depth
-                                });
+                                const evt: typeof events[number] = {
+                                    t: ev.t,
+                                    type: ev.type,
+                                    fn: ev.fn,
+                                    file: ev.file,
+                                    line: ev.line,
+                                    depth: ev.depth,
+                                };
+
+                                if (ev.args !== undefined) {
+                                    evt.args = sanitizeTraceArgs(ev.args);
+                                }
+                                if (ev.returnValue !== undefined) {
+                                    evt.returnValue = sanitizeTraceValue(ev.returnValue);
+                                }
+                                if (ev.error !== undefined) {
+                                    evt.error = sanitizeTraceValue(ev.error);
+                                }
+                                if (ev.threw !== undefined) {
+                                    evt.threw = Boolean(ev.threw);
+                                }
+
+                                events.push(evt);
                             }
                         });
                     }
