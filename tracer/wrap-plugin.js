@@ -87,6 +87,36 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             return '(anonymous)';
         }
 
+        function classifyFunction(path){
+            const n = path.node;
+
+            if (path.isClassMethod() || path.isClassPrivateMethod?.()) {
+                if (n.kind === 'constructor') return 'constructor';
+                if (n.kind === 'get') return 'getter';
+                if (n.kind === 'set') return 'setter';
+                if (n.static) return 'static-method';
+                return 'method';
+            }
+
+            if (path.isObjectMethod && path.isObjectMethod()) {
+                if (n.kind === 'get') return 'getter';
+                if (n.kind === 'set') return 'setter';
+                return 'method';
+            }
+
+            if (path.isClassPrivateProperty?.()) return 'method';
+
+            if (path.isArrowFunctionExpression()) return 'arrow';
+
+            if (path.isFunctionDeclaration()) return 'function';
+            if (path.isFunctionExpression()) {
+                if (path.parentPath?.isClassProperty?.()) return 'method';
+                return 'function';
+            }
+
+            return 'function';
+        }
+
         function shouldWrap(path, name){
             // skip getters/setters unless asked
             if (!wrapGettersSetters &&
@@ -116,6 +146,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
             const file = mapped?.file || filenameForMeta;
             const line = mapped?.line ?? loc?.line ?? null;
+            const fnType = classifyFunction(path);
 
             if (t.isArrowFunctionExpression(n) && !t.isBlockStatement(n.body)) {
                 const bodyExprPath = path.get('body');
@@ -170,7 +201,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const enter = t.expressionStatement(
                 markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
-                    [ t.stringLiteral(name), obj({ file, line }), obj({ args: argsId }) ]
+                    [ t.stringLiteral(name), obj({ file, line, functionType: fnType }), obj({ args: argsId }) ]
                 ))
             );
 
@@ -178,7 +209,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
                     [
-                        obj({ fn: name, file, line }),
+                        obj({ fn: name, file, line, functionType: fnType }),
                         obj({ returnValue: resultId, error: errorId, threw: threwId, args: argsId })
                     ]
                 ))
