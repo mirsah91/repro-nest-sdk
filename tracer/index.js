@@ -6,7 +6,8 @@ const {
     startV8,
     printV8,
     patchConsole,
-    getCurrentTraceId
+    getCurrentTraceId,
+    setFunctionLogsEnabled
 } = require('./runtime');
 const { installCJS } = require('./cjs-hook');
 
@@ -28,11 +29,14 @@ function init(opts = {}) {
         ],
         mode = process.env.TRACE_MODE || 'v8',
         samplingMs = 10,
+        functionLogs,
     } = opts;
 
     // install http ALS context so Express/Nest/Fastify get traceIds without extra code
     patchHttp();
     patchConsole();
+
+    if (typeof functionLogs === 'boolean') setFunctionLogsEnabled(functionLogs);
 
     if (instrument) {
         // CJS require hook (for require())
@@ -52,6 +56,7 @@ function api(){
         tracer: trace,
         withTrace: trace.withTrace,
         getCurrentTraceId,
+        setFunctionLogsEnabled,
     };
 }
 module.exports = api();

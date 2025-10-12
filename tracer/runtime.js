@@ -4,7 +4,8 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const als = new AsyncLocalStorage(); // { traceId, depth }
 const listeners = new Set();
 let EMITTING = false;
-const quiet = process.env.TRACE_QUIET === '1';
+const quietEnv = process.env.TRACE_QUIET === '1';
+let functionLogsEnabled = !quietEnv;
 
 // ---- console patch: trace console.* as top-level calls (safe; no recursion) ----
 let CONSOLE_PATCHED = false;
@@ -51,6 +52,7 @@ const trace = {
             fn,
             file: meta?.file,
             line: meta?.line,
+            functionType: meta?.functionType || null,
             traceId: ctx.traceId,
             depth: ctx.depth,
             args: detail?.args
@@ -62,7 +64,8 @@ const trace = {
         const baseMeta = {
             fn: meta?.fn,
             file: meta?.file,
-            line: meta?.line
+            line: meta?.line,
+            functionType: meta?.functionType || null
         };
         const baseDetail = {
             args: detail?.args,
@@ -93,6 +96,7 @@ const trace = {
                 fn: baseMeta.fn,
                 file: baseMeta.file,
                 line: baseMeta.line,
+                functionType: baseMeta.functionType || null,
                 traceId: ctx.traceId,
                 depth: depthAtExit,
                 returnValue: finalDetail.returnValue,
@@ -149,7 +153,12 @@ function emit(ev){
     finally { EMITTING = false; }
 }
 
-if (!quiet) {
+let loggerState = null;
+let loggerBeforeExitInstalled = false;
+
+function ensureFunctionLogger() {
+    if (loggerState) return loggerState;
+
     // ---- filtered logger: full detail for app code, top-level only for node_modules ----
     const isNodeModules = (file) => !!file && file.replace(/\\/g, '/').includes('/node_modules/');
 
@@ -190,6 +199,7 @@ if (!quiet) {
     // Re-entrancy guard for emitting
     let IN_LOG = false;
     trace.on(ev => {
+        if (!functionLogsEnabled) return;
         if (IN_LOG) return;
         IN_LOG = true;
         try {
@@ -247,11 +257,24 @@ if (!quiet) {
         }
     });
 
-    // flush any coalesced repeats before exiting
-    process.on('beforeExit', () => {
-        for (const s of stateByTrace.values()) flushRepeat(s);
-    });
+    if (!loggerBeforeExitInstalled) {
+        // flush any coalesced repeats before exiting
+        process.on('beforeExit', () => {
+            for (const s of stateByTrace.values()) flushRepeat(s);
+        });
+        loggerBeforeExitInstalled = true;
+    }
+
+    loggerState = { stateByTrace };
+    return loggerState;
 }
+
+function setFunctionLogsEnabled(enabled) {
+    functionLogsEnabled = !!enabled;
+    if (functionLogsEnabled) ensureFunctionLogger();
+}
+
+if (functionLogsEnabled) ensureFunctionLogger();
 
 function short(p){ try{ const cwd = process.cwd().replace(/\\/g,'/'); return String(p).replace(cwd+'/',''); } catch { return p; } }
 
@@ -364,7 +387,7 @@ function startV8(samplingMs = 10){
     inspectorSession.post('Profiler.enable');
     inspectorSession.post('Profiler.setSamplingInterval', { interval: samplingMs * 1000 });
     inspectorSession.post('Profiler.start');
-    if (!quiet) process.stdout.write(`[v8] profiler started @ ${samplingMs}ms\n`);
+    if (!quietEnv) process.stdout.write(`[v8] profiler started @ ${samplingMs}ms\n`);
 }
 function stopV8(){ return new Promise((resolve, reject) => {
     if (!inspectorSession) return resolve(null);
@@ -389,7 +412,7 @@ function summarize(profile, topN=10){
     return { top };
 }
 async function printV8(){ const p=await stopV8(); const s=summarize(p);
-    if (!quiet) { process.stdout.write('\n[v8] Top self-time:\n');
+    if (!quietEnv) { process.stdout.write('\n[v8] Top self-time:\n');
         for (const r of s.top) process.stdout.write(`  ${r.ms}ms  ${r.fn}  ${r.url ?? ''}:${r.line ?? ''}\n`);
     }
 }
@@ -406,6 +429,7 @@ module.exports = {
     printV8,
     patchConsole,
     getCurrentTraceId,
+    setFunctionLogsEnabled,
     // export symbols so the require hook can tag function origins
     SYM_SRC_FILE,
     SYM_IS_APP,

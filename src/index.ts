@@ -81,11 +81,172 @@ type TracerApi = {
     tracer?: { on: (fn: (ev: any) => void) => () => void };
     getCurrentTraceId?: () => string | null;
     patchHttp?: () => void; // optional in your tracer
+    setFunctionLogsEnabled?: (enabled: boolean) => void;
 };
 
 function escapeRx(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 let __TRACER__: TracerApi | null = null;
 let __TRACER_READY = false;
+
+type TraceEventPhase = 'enter' | 'exit';
+export type TraceRulePattern = string | RegExp | Array<string | RegExp>;
+
+export type TraceEventForFilter = {
+    type: TraceEventPhase; // legacy alias for eventType
+    eventType: TraceEventPhase;
+    functionType?: string | null;
+    fn?: string;
+    file?: string | null;
+    depth?: number;
+    library?: string | null;
+};
+
+/**
+ * Declarative rule that disables trace events matching the provided patterns.
+ *
+ * Each property accepts a string (substring match), a RegExp, or an array of
+ * either. When an array is provided, a single match of any entry is enough to
+ * drop the event. Provide no value to leave that dimension unrestricted.
+ */
+export type DisableFunctionTraceRule = {
+    /** Shortcut for {@link functionName}. */
+    fn?: TraceRulePattern;
+    /** Function name (e.g. `"findOne"`, `/^UserService\./`). */
+    functionName?: TraceRulePattern;
+    /** Absolute file path where the function was defined. */
+    file?: TraceRulePattern;
+    /** Shortcut for {@link library}. */
+    lib?: TraceRulePattern;
+    /** Library/package name inferred from the file path (e.g. `"mongoose"`). */
+    library?: TraceRulePattern;
+    /** Shortcut for {@link functionType}. */
+    type?: TraceRulePattern;
+    /** Function classification such as `"constructor"`, `"method"`, or `"arrow"`. */
+    functionType?: TraceRulePattern;
+    /** Shortcut for {@link eventType}. */
+    event?: TraceRulePattern;
+    /** Trace phase to filter (`"enter"` or `"exit"`). */
+    eventType?: TraceRulePattern;
+};
+
+export type DisableFunctionTracePredicate = (event: TraceEventForFilter) => boolean;
+
+export type DisableFunctionTraceConfig =
+    | DisableFunctionTraceRule
+    | DisableFunctionTracePredicate;
+
+let disabledFunctionTraceRules: DisableFunctionTraceConfig[] = [];
+let disabledFunctionTypePatterns: Array<string | RegExp> = [];
+let __TRACE_LOG_PREF: boolean | null = null;
+
+function hasOwn(obj: unknown, key: string): boolean {
+    return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function normalizePatternArray<T>(pattern?: T | T[] | null): Exclude<T, null | undefined>[] {
+    if (pattern === undefined || pattern === null) return [];
+    const arr = Array.isArray(pattern) ? pattern : [pattern];
+    return arr.filter((entry): entry is Exclude<T, null | undefined> => entry !== undefined && entry !== null);
+}
+
+function matchesPattern(
+    value: string | null | undefined,
+    pattern?: TraceRulePattern,
+    defaultWhenEmpty: boolean = true,
+): boolean {
+    if (pattern === undefined || pattern === null) return defaultWhenEmpty;
+    const val = value == null ? '' : String(value);
+    const candidates = normalizePatternArray(pattern);
+    if (!candidates.length) return defaultWhenEmpty;
+    return candidates.some(entry => {
+        if (entry instanceof RegExp) {
+            try { return entry.test(val); } catch { return false; }
+        }
+        const needle = String(entry).toLowerCase();
+        if (!needle) return val === '';
+        return val.toLowerCase().includes(needle);
+    });
+}
+
+function inferLibraryNameFromFile(file?: string | null): string | null {
+    if (!file) return null;
+    const normalized = String(file).replace(/\\/g, '/');
+    const idx = normalized.lastIndexOf('/node_modules/');
+    if (idx === -1) return null;
+    const remainder = normalized.slice(idx + '/node_modules/'.length);
+    if (!remainder) return null;
+    const segments = remainder.split('/');
+    if (!segments.length) return null;
+    if (segments[0].startsWith('@') && segments.length >= 2) {
+        return `${segments[0]}/${segments[1]}`;
+    }
+    return segments[0] || null;
+}
+
+function matchesRule(rule: DisableFunctionTraceRule, event: TraceEventForFilter): boolean {
+    const namePattern = rule.fn ?? rule.functionName;
+    if (!matchesPattern(event.fn, namePattern)) return false;
+
+    if (!matchesPattern(event.file, rule.file)) return false;
+
+    const libPattern = rule.lib ?? rule.library;
+    if (!matchesPattern(event.library, libPattern)) return false;
+
+    const fnTypePattern = rule.functionType ?? rule.type;
+    if (!matchesPattern(event.functionType, fnTypePattern)) return false;
+
+    const eventTypePattern = rule.eventType ?? rule.event;
+    if (!matchesPattern(event.eventType, eventTypePattern)) return false;
+
+    return true;
+}
+
+function shouldDropTraceEvent(event: TraceEventForFilter): boolean {
+    if (disabledFunctionTypePatterns.length) {
+        if (matchesPattern(event.functionType, disabledFunctionTypePatterns, false)) {
+            return true;
+        }
+    }
+    if (!disabledFunctionTraceRules.length) return false;
+    for (const rule of disabledFunctionTraceRules) {
+        try {
+            if (typeof rule === 'function') {
+                if (rule(event)) return true;
+            } else if (matchesRule(rule, event)) {
+                return true;
+            }
+        } catch {
+            // ignore user filter errors
+        }
+    }
+    return false;
+}
+
+export function setDisabledFunctionTraces(rules?: DisableFunctionTraceConfig[] | null) {
+    if (!rules || !Array.isArray(rules)) {
+        disabledFunctionTraceRules = [];
+        return;
+    }
+    disabledFunctionTraceRules = rules.filter((rule): rule is DisableFunctionTraceConfig => !!rule);
+}
+
+export function setDisabledFunctionTypes(patterns?: TraceRulePattern | null) {
+    disabledFunctionTypePatterns = normalizePatternArray(patterns);
+}
+
+function applyTraceLogPreference(tracer?: TracerApi | null) {
+    if (__TRACE_LOG_PREF === null) return;
+    try { tracer?.setFunctionLogsEnabled?.(__TRACE_LOG_PREF); } catch {}
+}
+
+export function setReproTraceLogsEnabled(enabled: boolean) {
+    __TRACE_LOG_PREF = !!enabled;
+    applyTraceLogPreference(__TRACER__);
+}
+
+export function enableReproTraceLogs() { setReproTraceLogsEnabled(true); }
+
+export function disableReproTraceLogs() { setReproTraceLogsEnabled(false); }
 
 // (function ensureTracerAutoInit() {
 //     if (__TRACER_READY) return;
@@ -137,6 +298,26 @@ type TracerInitOpts = {
     samplingMs?: number;
 };
 
+export type ReproTracingInitOptions = TracerInitOpts & {
+    /**
+     * Optional list of rules or predicates that suppress unwanted function
+     * trace events. When omitted, every instrumented function will be
+     * recorded. Provide an empty array to reset filters after a previous call.
+     */
+    disableFunctionTraces?: DisableFunctionTraceConfig[] | null;
+    /**
+     * Convenience filter that disables every trace event emitted for the
+     * provided function types (e.g. `"constructor"`). Accepts a string,
+     * regular expression, or array matching the rule syntax above.
+     */
+    disableFunctionTypes?: TraceRulePattern | null;
+    /**
+     * Enables or silences console logs emitted by the tracer when functions
+     * are entered/exited. Equivalent to calling `setReproTraceLogsEnabled`.
+     */
+    logFunctionCalls?: boolean;
+};
+
 function defaultTracerInitOpts(): TracerInitOpts {
     const cwd = process.cwd().replace(/\\/g, '/');
     const sdkRoot = __dirname.replace(/\\/g, '/');
@@ -159,14 +340,39 @@ function defaultTracerInitOpts(): TracerInitOpts {
 }
 
 /** Call this from the client app to enable tracing. Safe to call multiple times. */
-export function initReproTracing(opts?: TracerInitOpts) {
-    if (__TRACER_READY) return __TRACER__;
+export function initReproTracing(opts?: ReproTracingInitOptions) {
+    const options = opts ?? {};
+
+    if (hasOwn(options, 'disableFunctionTypes')) {
+        setDisabledFunctionTypes(options.disableFunctionTypes ?? null);
+    }
+    if (hasOwn(options, 'disableFunctionTraces')) {
+        setDisabledFunctionTraces(options.disableFunctionTraces ?? null);
+    }
+    if (hasOwn(options, 'logFunctionCalls') && typeof options.logFunctionCalls === 'boolean') {
+        setReproTraceLogsEnabled(options.logFunctionCalls);
+    }
+
+    if (__TRACER_READY) {
+        applyTraceLogPreference(__TRACER__);
+        return __TRACER__;
+    }
     try {
         const tracerPkg: TracerApi = require('../tracer');
-        const initOpts = { ...defaultTracerInitOpts(), ...(opts || {}) };
+        __TRACER__ = tracerPkg;
+
+        applyTraceLogPreference(tracerPkg);
+
+        const {
+            disableFunctionTraces: _disableFunctionTraces,
+            disableFunctionTypes: _disableFunctionTypes,
+            logFunctionCalls: _logFunctionCalls,
+            ...rest
+        } = options;
+        const initOpts = { ...defaultTracerInitOpts(), ...(rest as TracerInitOpts) };
         tracerPkg.init?.(initOpts);
         tracerPkg.patchHttp?.();
-        __TRACER__ = tracerPkg;
+        applyTraceLogPreference(tracerPkg);
         __TRACER_READY = true;
     } catch {
         __TRACER__ = null; // SDK still works without tracer
@@ -423,6 +629,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
             const events: Array<{
                 t: number;
                 type: 'enter' | 'exit';
+                functionType?: string | null;
                 fn?: string;
                 file?: string;
                 line?: number | null;
@@ -451,6 +658,10 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                                     depth: ev.depth,
                                 };
 
+                                if (ev.functionType !== undefined) {
+                                    evt.functionType = ev.functionType;
+                                }
+
                                 if (ev.args !== undefined) {
                                     evt.args = sanitizeTraceArgs(ev.args);
                                 }
@@ -462,6 +673,20 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                                 }
                                 if (ev.threw !== undefined) {
                                     evt.threw = Boolean(ev.threw);
+                                }
+
+                                const candidate: TraceEventForFilter = {
+                                    type: evt.type,
+                                    eventType: evt.type,
+                                    functionType: ev.functionType ?? null,
+                                    fn: evt.fn,
+                                    file: evt.file ?? null,
+                                    depth: evt.depth,
+                                    library: inferLibraryNameFromFile(evt.file),
+                                };
+
+                                if (shouldDropTraceEvent(candidate)) {
+                                    return;
                                 }
 
                                 events.push(evt);
