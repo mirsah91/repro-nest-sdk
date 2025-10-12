@@ -101,15 +101,31 @@ export type TraceEventForFilter = {
     library?: string | null;
 };
 
+/**
+ * Declarative rule that disables trace events matching the provided patterns.
+ *
+ * Each property accepts a string (substring match), a RegExp, or an array of
+ * either. When an array is provided, a single match of any entry is enough to
+ * drop the event. Provide no value to leave that dimension unrestricted.
+ */
 export type DisableFunctionTraceRule = {
+    /** Shortcut for {@link functionName}. */
     fn?: TraceRulePattern;
+    /** Function name (e.g. `"findOne"`, `/^UserService\./`). */
     functionName?: TraceRulePattern;
+    /** Absolute file path where the function was defined. */
     file?: TraceRulePattern;
+    /** Shortcut for {@link library}. */
     lib?: TraceRulePattern;
+    /** Library/package name inferred from the file path (e.g. `"mongoose"`). */
     library?: TraceRulePattern;
+    /** Shortcut for {@link functionType}. */
     type?: TraceRulePattern;
+    /** Function classification such as `"constructor"`, `"method"`, or `"arrow"`. */
     functionType?: TraceRulePattern;
+    /** Shortcut for {@link eventType}. */
     event?: TraceRulePattern;
+    /** Trace phase to filter (`"enter"` or `"exit"`). */
     eventType?: TraceRulePattern;
 };
 
@@ -268,7 +284,16 @@ type TracerInitOpts = {
 };
 
 export type ReproTracingInitOptions = TracerInitOpts & {
+    /**
+     * Optional list of rules or predicates that suppress unwanted function
+     * trace events. When omitted, every instrumented function will be
+     * recorded. Provide an empty array to reset filters after a previous call.
+     */
     disableFunctionTraces?: DisableFunctionTraceConfig[] | null;
+    /**
+     * Enables or silences console logs emitted by the tracer when functions
+     * are entered/exited. Equivalent to calling `setReproTraceLogsEnabled`.
+     */
     logFunctionCalls?: boolean;
 };
 
