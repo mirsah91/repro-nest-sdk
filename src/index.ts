@@ -89,7 +89,7 @@ let __TRACER__: TracerApi | null = null;
 let __TRACER_READY = false;
 
 type TraceEventPhase = 'enter' | 'exit';
-type TraceRulePattern = string | RegExp | Array<string | RegExp>;
+export type TraceRulePattern = string | RegExp | Array<string | RegExp>;
 
 export type TraceEventForFilter = {
     type: TraceEventPhase; // legacy alias for eventType
@@ -136,22 +136,28 @@ export type DisableFunctionTraceConfig =
     | DisableFunctionTracePredicate;
 
 let disabledFunctionTraceRules: DisableFunctionTraceConfig[] = [];
+let disabledFunctionTypePatterns: Array<string | RegExp> = [];
 let __TRACE_LOG_PREF: boolean | null = null;
 
 function hasOwn(obj: unknown, key: string): boolean {
     return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
-function normalizePatternArray<T>(pattern?: T | T[]): T[] {
+function normalizePatternArray<T>(pattern?: T | T[] | null): Exclude<T, null | undefined>[] {
     if (pattern === undefined || pattern === null) return [];
-    return Array.isArray(pattern) ? pattern : [pattern];
+    const arr = Array.isArray(pattern) ? pattern : [pattern];
+    return arr.filter((entry): entry is Exclude<T, null | undefined> => entry !== undefined && entry !== null);
 }
 
-function matchesPattern(value: string | null | undefined, pattern?: TraceRulePattern): boolean {
-    if (pattern === undefined || pattern === null) return true;
+function matchesPattern(
+    value: string | null | undefined,
+    pattern?: TraceRulePattern,
+    defaultWhenEmpty: boolean = true,
+): boolean {
+    if (pattern === undefined || pattern === null) return defaultWhenEmpty;
     const val = value == null ? '' : String(value);
     const candidates = normalizePatternArray(pattern);
-    if (!candidates.length) return true;
+    if (!candidates.length) return defaultWhenEmpty;
     return candidates.some(entry => {
         if (entry instanceof RegExp) {
             try { return entry.test(val); } catch { return false; }
@@ -196,6 +202,11 @@ function matchesRule(rule: DisableFunctionTraceRule, event: TraceEventForFilter)
 }
 
 function shouldDropTraceEvent(event: TraceEventForFilter): boolean {
+    if (disabledFunctionTypePatterns.length) {
+        if (matchesPattern(event.functionType, disabledFunctionTypePatterns, false)) {
+            return true;
+        }
+    }
     if (!disabledFunctionTraceRules.length) return false;
     for (const rule of disabledFunctionTraceRules) {
         try {
@@ -217,6 +228,10 @@ export function setDisabledFunctionTraces(rules?: DisableFunctionTraceConfig[] |
         return;
     }
     disabledFunctionTraceRules = rules.filter((rule): rule is DisableFunctionTraceConfig => !!rule);
+}
+
+export function setDisabledFunctionTypes(patterns?: TraceRulePattern | null) {
+    disabledFunctionTypePatterns = normalizePatternArray(patterns);
 }
 
 function applyTraceLogPreference(tracer?: TracerApi | null) {
@@ -291,6 +306,12 @@ export type ReproTracingInitOptions = TracerInitOpts & {
      */
     disableFunctionTraces?: DisableFunctionTraceConfig[] | null;
     /**
+     * Convenience filter that disables every trace event emitted for the
+     * provided function types (e.g. `"constructor"`). Accepts a string,
+     * regular expression, or array matching the rule syntax above.
+     */
+    disableFunctionTypes?: TraceRulePattern | null;
+    /**
      * Enables or silences console logs emitted by the tracer when functions
      * are entered/exited. Equivalent to calling `setReproTraceLogsEnabled`.
      */
@@ -322,6 +343,9 @@ function defaultTracerInitOpts(): TracerInitOpts {
 export function initReproTracing(opts?: ReproTracingInitOptions) {
     const options = opts ?? {};
 
+    if (hasOwn(options, 'disableFunctionTypes')) {
+        setDisabledFunctionTypes(options.disableFunctionTypes ?? null);
+    }
     if (hasOwn(options, 'disableFunctionTraces')) {
         setDisabledFunctionTraces(options.disableFunctionTraces ?? null);
     }
@@ -339,7 +363,12 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
 
         applyTraceLogPreference(tracerPkg);
 
-        const { disableFunctionTraces: _disableFunctionTraces, logFunctionCalls: _logFunctionCalls, ...rest } = options;
+        const {
+            disableFunctionTraces: _disableFunctionTraces,
+            disableFunctionTypes: _disableFunctionTypes,
+            logFunctionCalls: _logFunctionCalls,
+            ...rest
+        } = options;
         const initOpts = { ...defaultTracerInitOpts(), ...(rest as TracerInitOpts) };
         tracerPkg.init?.(initOpts);
         tracerPkg.patchHttp?.();

@@ -18,9 +18,26 @@ initReproTracing({
     // Provide a custom predicate for advanced logic
     (event) => event.fn?.startsWith('debug') ?? false,
   ],
+  disableFunctionTypes: ['constructor'],
   logFunctionCalls: false,
 });
 ```
+
+## `disableFunctionTypes`
+
+Shorthand for suppressing entire categories of functions such as constructors
+or getters. Provide a string, regular expression, or array of them and every
+matching trace event will be ignored, regardless of library or filename.
+
+```ts
+import { setDisabledFunctionTypes } from '@repro/sdk';
+
+setDisabledFunctionTypes(['constructor']);
+```
+
+Pass `null` or an empty array to reset the filter. This is useful when you want
+to silence noisy dependency-injection constructors globally while still
+allowing more targeted rules to run.
 
 ## `disableFunctionTraces`
 
