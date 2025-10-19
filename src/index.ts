@@ -736,8 +736,12 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                         t: Date.now(),
                     }]
                 });
+                console.log('traceBatches --->', traceBatches)
+
 
                 if (traceBatches.length) {
+                    console.log('inside traceBatches.length --->')
+
                     for (let i = 0; i < traceBatches.length; i++) {
                         const batch = traceBatches[i];
                         let traceStr = '[]';
@@ -755,6 +759,8 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                                 t: Date.now(),
                             }],
                         });
+                        console.log('inside post --->')
+
                     }
                 }
 
