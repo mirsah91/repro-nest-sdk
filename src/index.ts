@@ -486,6 +486,18 @@ const TRACE_VALUE_MAX_DEPTH = 3;
 const TRACE_VALUE_MAX_KEYS = 20;
 const TRACE_VALUE_MAX_ITEMS = 20;
 const TRACE_VALUE_MAX_STRING = 2000;
+const TRACE_BATCH_SIZE = 100;
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+    if (!Array.isArray(arr) || arr.length === 0) return [];
+    if (!size || size <= 0) return [arr.slice()];
+
+    const batches: T[][] = [];
+    for (let i = 0; i < arr.length; i += size) {
+        batches.push(arr.slice(i, i + size));
+    }
+    return batches;
+}
 
 function sanitizeTraceValue(value: any, depth = 0, seen: WeakSet<object> = new WeakSet()): any {
     if (value === null || value === undefined) return value;
@@ -704,8 +716,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
-                let traceStr = '[]';
-                try { traceStr = JSON.stringify(events); } catch {}
+                const traceBatches = chunkArray(events, TRACE_BATCH_SIZE);
 
                 post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
@@ -720,11 +731,32 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                             headers: {},
                             key,
                             respBody: capturedBody,
-                            trace: traceStr,
+                            trace: traceBatches.length ? undefined : '[]',
                         },
                         t: Date.now(),
                     }]
                 });
+
+                if (traceBatches.length) {
+                    for (let i = 0; i < traceBatches.length; i++) {
+                        const batch = traceBatches[i];
+                        let traceStr = '[]';
+                        try { traceStr = JSON.stringify(batch); } catch {}
+
+                        post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
+                            entries: [{
+                                actionId: aid,
+                                trace: traceStr,
+                                traceBatch: {
+                                    rid,
+                                    index: i,
+                                    total: traceBatches.length,
+                                },
+                                t: Date.now(),
+                            }],
+                        });
+                    }
+                }
 
                 try { unsubscribe && unsubscribe(); } catch {}
             });
