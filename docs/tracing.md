@@ -86,9 +86,12 @@ Provides a shorthand for muting every trace event whose source file matches the
 supplied patterns. Strings are case-insensitive and match either the filename
 suffix (when no slash is present) or any path segment (when the string contains
 `/`). For very short tokens (one or two characters), provide the full filename
-or basename you want to ignore (for example `"db"` to skip `db.ts`). Regular
-expressions receive the normalized path with forward slashes, so the same
-pattern works on all platforms.
+or basename you want to ignore (for example `"db"` to skip `db.ts`). When you
+filter by directory, single-segment folder names shorter than four characters
+(such as `"src/"` or `"db/"`) are ignored to prevent muting every trace; use a
+more specific path like `"src/services/"` or switch to a regular expression in
+those cases. Regular expressions receive the normalized path with forward
+slashes, so the same pattern works on all platforms.
 
 ```ts
 import { setDisabledTraceFiles } from '@repro/sdk';

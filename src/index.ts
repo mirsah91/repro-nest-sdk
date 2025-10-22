@@ -230,6 +230,14 @@ function filePatternsMatch(file: string | null | undefined, patterns: Array<stri
 
         if (normalizedPattern.includes('/')) {
             if (!normalizedFile) return false;
+            const segments = normalizedPattern.split('/').filter(Boolean);
+            if (!segments.length) return false;
+
+            const effectiveLength = segments.reduce((len, segment) => len + segment.length, 0);
+            if (segments.length === 1 && effectiveLength < 4) {
+                return false;
+            }
+
             return normalizedFile.includes(normalizedPattern);
         }
 
