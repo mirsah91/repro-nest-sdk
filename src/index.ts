@@ -150,6 +150,28 @@ function normalizePatternArray<T>(pattern?: T | T[] | null): Exclude<T, null | u
     return arr.filter((entry): entry is Exclude<T, null | undefined> => entry !== undefined && entry !== null);
 }
 
+function toFilePatternArray(pattern?: TraceRulePattern | null): Array<string | RegExp> {
+    const raw = normalizePatternArray(pattern);
+    const flattened: Array<string | RegExp> = [];
+    for (const entry of raw) {
+        if (Array.isArray(entry)) {
+            for (const nested of entry) {
+                if (nested === undefined || nested === null) continue;
+                if (typeof nested === 'string' || nested instanceof RegExp) {
+                    flattened.push(nested);
+                } else {
+                    flattened.push(String(nested));
+                }
+            }
+        } else if (typeof entry === 'string' || entry instanceof RegExp) {
+            flattened.push(entry);
+        } else {
+            flattened.push(String(entry));
+        }
+    }
+    return flattened;
+}
+
 function matchesPattern(
     value: string | null | undefined,
     pattern?: TraceRulePattern,
@@ -184,6 +206,38 @@ function inferLibraryNameFromFile(file?: string | null): string | null {
     return segments[0] || null;
 }
 
+function normalizePathLike(value?: string | null): string {
+    if (value == null) return '';
+    return String(value).replace(/\\/g, '/').toLowerCase();
+}
+
+function filePatternsMatch(file: string | null | undefined, patterns: Array<string | RegExp>): boolean {
+    if (!patterns.length) return false;
+    const normalizedFile = normalizePathLike(file);
+    const regexTarget = file == null ? '' : String(file).replace(/\\/g, '/');
+
+    return patterns.some(pattern => {
+        if (pattern instanceof RegExp) {
+            try { return pattern.test(regexTarget); } catch { return false; }
+        }
+
+        const normalizedPattern = normalizePathLike(pattern);
+        if (!/[^/]/.test(normalizedPattern)) {
+            return false;
+        }
+
+        if (!normalizedFile) {
+            return false;
+        }
+
+        if (normalizedPattern.includes('/')) {
+            return normalizedFile.includes(normalizedPattern);
+        }
+
+        return normalizedFile.endsWith(normalizedPattern);
+    });
+}
+
 function matchesRule(rule: DisableFunctionTraceRule, event: TraceEventForFilter): boolean {
     const namePattern = rule.fn ?? rule.functionName;
     if (!matchesPattern(event.fn, namePattern)) return false;
@@ -204,7 +258,7 @@ function matchesRule(rule: DisableFunctionTraceRule, event: TraceEventForFilter)
 
 function shouldDropTraceEvent(event: TraceEventForFilter): boolean {
     if (disabledTraceFilePatterns.length) {
-        if (matchesPattern(event.file, disabledTraceFilePatterns, false)) {
+        if (filePatternsMatch(event.file ?? null, disabledTraceFilePatterns)) {
             return true;
         }
     }
@@ -241,7 +295,7 @@ export function setDisabledFunctionTypes(patterns?: TraceRulePattern | null) {
 }
 
 export function setDisabledTraceFiles(patterns?: TraceRulePattern | null) {
-    disabledTraceFilePatterns = normalizePatternArray(patterns);
+    disabledTraceFilePatterns = toFilePatternArray(patterns);
 }
 
 function applyTraceLogPreference(tracer?: TracerApi | null) {

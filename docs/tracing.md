@@ -19,6 +19,12 @@ initReproTracing({
     (event) => event.fn?.startsWith('debug') ?? false,
   ],
   disableFunctionTypes: ['constructor'],
+  // Silence every trace event emitted from specific source files
+  disableTraceFiles: [
+    'src/services/debug.service.ts',   // filename suffix match
+    'src/utils/',                      // directory match (must include a slash)
+    /node_modules\/some-logger\//i,    // or a RegExp against the normalized path
+  ],
   logFunctionCalls: false,
 });
 ```
@@ -73,6 +79,27 @@ setDisabledFunctionTraces([
 
 Pass `null` or an empty array to `initReproTracing` or `setDisabledFunctionTraces`
 to remove previously configured rules.
+
+## `disableTraceFiles`
+
+Provides a shorthand for muting every trace event whose source file matches the
+supplied patterns. Strings are case-insensitive and match either the filename
+suffix (when no slash is present) or any path segment (when the string contains
+`/`). Regular expressions receive the normalized path with forward slashes, so
+the same pattern works on all platforms.
+
+```ts
+import { setDisabledTraceFiles } from '@repro/sdk';
+
+// stop recording traces from local development helpers
+setDisabledTraceFiles([
+  'src/dev-tools/',
+  'scripts/seed.ts',
+]);
+
+// reset the filter later on
+setDisabledTraceFiles(null);
+```
 
 ## `logFunctionCalls`
 
