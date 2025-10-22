@@ -137,6 +137,7 @@ export type DisableFunctionTraceConfig =
 
 let disabledFunctionTraceRules: DisableFunctionTraceConfig[] = [];
 let disabledFunctionTypePatterns: Array<string | RegExp> = [];
+let disabledTraceFilePatterns: Array<string | RegExp> = [];
 let __TRACE_LOG_PREF: boolean | null = null;
 
 function hasOwn(obj: unknown, key: string): boolean {
@@ -202,6 +203,11 @@ function matchesRule(rule: DisableFunctionTraceRule, event: TraceEventForFilter)
 }
 
 function shouldDropTraceEvent(event: TraceEventForFilter): boolean {
+    if (disabledTraceFilePatterns.length) {
+        if (matchesPattern(event.file, disabledTraceFilePatterns, false)) {
+            return true;
+        }
+    }
     if (disabledFunctionTypePatterns.length) {
         if (matchesPattern(event.functionType, disabledFunctionTypePatterns, false)) {
             return true;
@@ -232,6 +238,10 @@ export function setDisabledFunctionTraces(rules?: DisableFunctionTraceConfig[] |
 
 export function setDisabledFunctionTypes(patterns?: TraceRulePattern | null) {
     disabledFunctionTypePatterns = normalizePatternArray(patterns);
+}
+
+export function setDisabledTraceFiles(patterns?: TraceRulePattern | null) {
+    disabledTraceFilePatterns = normalizePatternArray(patterns);
 }
 
 function applyTraceLogPreference(tracer?: TracerApi | null) {
@@ -312,6 +322,11 @@ export type ReproTracingInitOptions = TracerInitOpts & {
      */
     disableFunctionTypes?: TraceRulePattern | null;
     /**
+     * Disables trace collection for any file whose absolute path matches the
+     * supplied patterns. Useful to mute entire modules or directories.
+     */
+    disableTraceFiles?: TraceRulePattern | null;
+    /**
      * Enables or silences console logs emitted by the tracer when functions
      * are entered/exited. Equivalent to calling `setReproTraceLogsEnabled`.
      */
@@ -346,6 +361,9 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
     if (hasOwn(options, 'disableFunctionTypes')) {
         setDisabledFunctionTypes(options.disableFunctionTypes ?? null);
     }
+    if (hasOwn(options, 'disableTraceFiles')) {
+        setDisabledTraceFiles(options.disableTraceFiles ?? null);
+    }
     if (hasOwn(options, 'disableFunctionTraces')) {
         setDisabledFunctionTraces(options.disableFunctionTraces ?? null);
     }
@@ -366,6 +384,7 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
         const {
             disableFunctionTraces: _disableFunctionTraces,
             disableFunctionTypes: _disableFunctionTypes,
+            disableTraceFiles: _disableTraceFiles,
             logFunctionCalls: _logFunctionCalls,
             ...rest
         } = options;
@@ -486,6 +505,117 @@ const TRACE_VALUE_MAX_DEPTH = 3;
 const TRACE_VALUE_MAX_KEYS = 20;
 const TRACE_VALUE_MAX_ITEMS = 20;
 const TRACE_VALUE_MAX_STRING = 2000;
+
+const QUERY_RESULT_MAX_ITEMS = 20;
+const QUERY_RESULT_MAX_DEPTH = 3;
+
+function unwrapMongooseValue(value: any): any {
+    if (value === null || value === undefined) return value;
+
+    const mAny = mongoose as any;
+    const mTypes = mAny?.Types ?? {};
+    const mongoBson = mAny?.mongo ?? {};
+
+    try {
+        if (mTypes.ObjectId && value instanceof mTypes.ObjectId) return value.toString();
+        if (mongoBson.ObjectId && value instanceof mongoBson.ObjectId) return value.toString();
+        if (mTypes.Decimal128 && value instanceof mTypes.Decimal128) return value.toString();
+        if (mongoBson.Decimal128 && value instanceof mongoBson.Decimal128) return value.toString();
+        if (mTypes.Long && value instanceof mTypes.Long) return value.toString();
+        if (mongoBson.Long && value instanceof mongoBson.Long) return value.toString();
+        if (mTypes.Double && value instanceof mTypes.Double) return value.valueOf();
+        if (mTypes.Map && value instanceof mTypes.Map) {
+            const obj: Record<string, any> = {};
+            for (const [k, v] of value) {
+                obj[k] = unwrapMongooseValue(v);
+            }
+            return obj;
+        }
+        if (mTypes.Array && value instanceof mTypes.Array) {
+            return Array.from(value);
+        }
+    } catch { /* fall back below */ }
+
+    if (Array.isArray(value)) return value;
+
+    if (typeof value === 'object') {
+        if (typeof (value as any).toObject === 'function') {
+            try {
+                return (value as any).toObject({
+                    depopulate: true,
+                    flattenMaps: true,
+                    virtuals: false,
+                    getters: false,
+                });
+            } catch { /* fall back */ }
+        }
+        if ((value as any).$__ && typeof (value as any).toJSON === 'function') {
+            try {
+                return (value as any).toJSON({
+                    depopulate: true,
+                    flattenMaps: true,
+                    virtuals: false,
+                    getters: false,
+                });
+            } catch { /* fall back */ }
+        }
+        if ((value as any)._doc && typeof (value as any)._doc === 'object') {
+            return (value as any)._doc;
+        }
+    }
+
+    return value;
+}
+
+function sanitizeQueryResultValue(value: any, depth = 0): any {
+    if (value === null || value === undefined) return value;
+
+    if (depth >= QUERY_RESULT_MAX_DEPTH) {
+        return sanitizeTraceValue(unwrapMongooseValue(value));
+    }
+
+    const plain = unwrapMongooseValue(value);
+
+    if (Array.isArray(plain)) {
+        const items = plain.slice(0, QUERY_RESULT_MAX_ITEMS)
+            .map(item => sanitizeQueryResultValue(item, depth + 1));
+        return items;
+    }
+
+    if (plain && typeof plain === 'object' && !Buffer.isBuffer(plain)) {
+        if (plain instanceof Date || plain instanceof RegExp || plain instanceof Error) {
+            return sanitizeTraceValue(plain);
+        }
+
+        const keys = Object.keys(plain);
+        const out: Record<string, any> = {};
+        for (const key of keys.slice(0, TRACE_VALUE_MAX_KEYS)) {
+            try {
+                out[key] = sanitizeQueryResultValue((plain as any)[key], depth + 1);
+            } catch (err) {
+                out[key] = `[Cannot serialize: ${(err as Error)?.message || 'unknown error'}]`;
+            }
+        }
+        if (keys.length > TRACE_VALUE_MAX_KEYS) {
+            out.__truncatedKeys = keys.length - TRACE_VALUE_MAX_KEYS;
+        }
+        const ctor = (plain as any)?.constructor?.name;
+        if (ctor && ctor !== 'Object') {
+            out.__class = ctor;
+        }
+        return out;
+    }
+
+    return sanitizeTraceValue(plain);
+}
+
+function buildArrayResultMeta(raw: any[]): { values: any[]; total: number; omitted: number } {
+    const total = raw.length;
+    const limited = raw.slice(0, QUERY_RESULT_MAX_ITEMS);
+    const values = limited.map(item => sanitizeQueryResultValue(item));
+    const omitted = total > QUERY_RESULT_MAX_ITEMS ? total - QUERY_RESULT_MAX_ITEMS : 0;
+    return { values, total, omitted };
+}
 
 function sanitizeTraceValue(value: any, depth = 0, seen: WeakSet<object> = new WeakSet()): any {
     if (value === null || value === undefined) return value;
@@ -939,11 +1069,35 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
 }
 
 function summarizeQueryResult(op: string, res: any) {
-    if (op === 'find' || op === 'findOne' || op === 'aggregate' || op.startsWith('count')) {
-        if (Array.isArray(res)) return { docsCount: res.length };
-        if (res && typeof res === 'object' && typeof (res as any).toArray === 'function') return { docsCount: undefined };
-        if (res == null) return { docsCount: 0 };
-        return { docsCount: 1 };
+    if (op === 'find' || op === 'aggregate') {
+        if (res && typeof res === 'object' && typeof (res as any).toArray === 'function') {
+            return { docs: [], docsCount: undefined };
+        }
+        const array = Array.isArray(res) ? res : res == null ? [] : [res];
+        const { values, total, omitted } = buildArrayResultMeta(array);
+        const meta: Record<string, any> = { docs: values, docsCount: total };
+        if (omitted > 0) meta.omitted = omitted;
+        return meta;
+    }
+    if (op === 'findOne') {
+        if (res && typeof res === 'object' && typeof (res as any).toArray === 'function') {
+            return { doc: null, found: false };
+        }
+        if (res == null) return { doc: null, found: false };
+        return { doc: sanitizeQueryResultValue(res), found: true };
+    }
+    if (op === 'distinct') {
+        const array = Array.isArray(res) ? res : res == null ? [] : [res];
+        const { values, total, omitted } = buildArrayResultMeta(array);
+        const meta: Record<string, any> = { values, valuesCount: total };
+        if (omitted > 0) meta.omitted = omitted;
+        return meta;
+    }
+    if (op.startsWith('count')) {
+        if (typeof res === 'number') return { count: res };
+        const value = sanitizeQueryResultValue(res);
+        if (typeof value === 'number') return { count: value };
+        return { value };
     }
     return pickWriteStats(res);
 }
