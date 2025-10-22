@@ -85,8 +85,10 @@ to remove previously configured rules.
 Provides a shorthand for muting every trace event whose source file matches the
 supplied patterns. Strings are case-insensitive and match either the filename
 suffix (when no slash is present) or any path segment (when the string contains
-`/`). Regular expressions receive the normalized path with forward slashes, so
-the same pattern works on all platforms.
+`/`). For very short tokens (one or two characters), provide the full filename
+or basename you want to ignore (for example `"db"` to skip `db.ts`). Regular
+expressions receive the normalized path with forward slashes, so the same
+pattern works on all platforms.
 
 ```ts
 import { setDisabledTraceFiles } from '@repro/sdk';

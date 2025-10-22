@@ -216,25 +216,39 @@ function filePatternsMatch(file: string | null | undefined, patterns: Array<stri
     const normalizedFile = normalizePathLike(file);
     const regexTarget = file == null ? '' : String(file).replace(/\\/g, '/');
 
+    if (!normalizedFile && !regexTarget) return false;
+
     return patterns.some(pattern => {
         if (pattern instanceof RegExp) {
             try { return pattern.test(regexTarget); } catch { return false; }
         }
 
-        const normalizedPattern = normalizePathLike(pattern);
-        if (!/[^/]/.test(normalizedPattern)) {
-            return false;
-        }
-
-        if (!normalizedFile) {
+        const normalizedPattern = normalizePathLike(pattern).trim();
+        if (!normalizedPattern || !/[^/]/.test(normalizedPattern)) {
             return false;
         }
 
         if (normalizedPattern.includes('/')) {
+            if (!normalizedFile) return false;
             return normalizedFile.includes(normalizedPattern);
         }
 
-        return normalizedFile.endsWith(normalizedPattern);
+        const filename = normalizedFile.split('/').pop() ?? '';
+        if (!filename) {
+            return false;
+        }
+
+        const stem = filename.replace(/\.[^.]*$/, '');
+
+        if (!normalizedPattern.includes('.') && normalizedPattern.length < 3) {
+            return filename === normalizedPattern || stem === normalizedPattern;
+        }
+
+        if (normalizedPattern.includes('.')) {
+            return filename.endsWith(normalizedPattern);
+        }
+
+        return filename.endsWith(normalizedPattern) || stem.endsWith(normalizedPattern);
     });
 }
 
