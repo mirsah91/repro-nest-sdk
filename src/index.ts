@@ -558,14 +558,26 @@ function sanitizeTraceValue(value: any, depth = 0, seen: WeakSet<object> = new W
     }
 
     if (type !== 'object') return String(value);
+
+    if (!Array.isArray(value) && !(value instanceof Map) && !(value instanceof Set)) {
+        const dehydrated = dehydrateComplexValue(value);
+        if (dehydrated !== value) {
+            return sanitizeTraceValue(dehydrated, depth, seen);
+        }
+    }
+
     if (seen.has(value)) return '[Circular]';
     seen.add(value);
 
     if (depth >= TRACE_VALUE_MAX_DEPTH) {
+        const shallow = safeJson(value);
+        if (shallow !== undefined) {
+            return shallow;
+        }
         const ctor = value?.constructor?.name;
         return ctor && ctor !== 'Object'
-            ? `[${ctor} depth>${TRACE_VALUE_MAX_DEPTH}]`
-            : `[Object depth>${TRACE_VALUE_MAX_DEPTH}]`;
+            ? { __class: ctor, __truncated: `depth>${TRACE_VALUE_MAX_DEPTH}` }
+            : { __truncated: `depth>${TRACE_VALUE_MAX_DEPTH}` };
     }
 
     if (Array.isArray(value)) {
@@ -1007,13 +1019,26 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
 }
 
 function summarizeQueryResult(op: string, res: any) {
-    if (op === 'find' || op === 'findOne' || op === 'aggregate' || op.startsWith('count')) {
-        if (Array.isArray(res)) return { docsCount: res.length };
-        if (res && typeof res === 'object' && typeof (res as any).toArray === 'function') return { docsCount: undefined };
-        if (res == null) return { docsCount: 0 };
-        return { docsCount: 1 };
+    const resultPreview = sanitizeResultForMeta(res);
+
+    if (op === 'find' || op === 'findOne' || op === 'aggregate' || op === 'distinct' || op.startsWith('count')) {
+        const summary: Record<string, any> = {};
+        if (Array.isArray(res)) summary.docsCount = res.length;
+        else if (res && typeof res === 'object' && typeof (res as any).toArray === 'function') summary.docsCount = undefined;
+        else if (res == null) summary.docsCount = 0;
+        else summary.docsCount = 1;
+
+        if (typeof resultPreview !== 'undefined') {
+            summary.result = resultPreview;
+        }
+        return summary;
     }
-    return pickWriteStats(res);
+
+    const stats = pickWriteStats(res);
+    if (typeof resultPreview !== 'undefined') {
+        return { ...stats, result: resultPreview };
+    }
+    return stats;
 }
 
 function summarizeBulkResult(res: any) {
@@ -1036,6 +1061,46 @@ function pickWriteStats(r: any) {
 
 function safeJson(v: any) {
     try { return v == null ? undefined : JSON.parse(JSON.stringify(v)); } catch { return undefined; }
+}
+
+function sanitizeResultForMeta(value: any) {
+    if (value === undefined) return undefined;
+    if (typeof value === 'function') return undefined;
+    try {
+        return sanitizeTraceValue(value);
+    } catch {
+        const fallback = safeJson(value);
+        return fallback === undefined ? undefined : fallback;
+    }
+}
+
+function dehydrateComplexValue(value: any) {
+    if (!value || typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value;
+    if (value instanceof Date || value instanceof RegExp || Buffer.isBuffer(value)) return value;
+    if (value instanceof Map || value instanceof Set) return value;
+
+    try {
+        if (typeof (value as any).toJSON === 'function') {
+            const plain = (value as any).toJSON();
+            if (plain && plain !== value) return plain;
+        }
+    } catch {}
+
+    try {
+        if (typeof (value as any).toObject === 'function') {
+            const plain = (value as any).toObject();
+            if (plain && plain !== value) return plain;
+        }
+    } catch {}
+
+    const ctor = (value as any)?.constructor?.name;
+    if (ctor && ctor !== 'Object') {
+        const plain = safeJson(value);
+        if (plain !== undefined) return plain;
+    }
+
+    return value;
 }
 
 function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
