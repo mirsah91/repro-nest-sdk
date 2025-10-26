@@ -103,6 +103,13 @@ export type TraceEventForFilter = {
     library?: string | null;
 };
 
+/** Lightweight helper to disable every trace emitted from specific files. */
+export interface DisableTraceByFilename {
+    file: TraceRulePattern;
+}
+
+type DisableTraceFileConfig = TraceRulePattern | DisableTraceByFilename | null | undefined;
+
 /**
  * Declarative rule that disables trace events matching the provided patterns.
  *
@@ -139,6 +146,7 @@ export type DisableFunctionTraceConfig =
 
 let disabledFunctionTraceRules: DisableFunctionTraceConfig[] = [];
 let disabledFunctionTypePatterns: Array<string | RegExp> = [];
+let disabledTraceFilePatterns: Array<string | RegExp> = [];
 let __TRACE_LOG_PREF: boolean | null = null;
 
 function hasOwn(obj: unknown, key: string): boolean {
@@ -204,6 +212,11 @@ function matchesRule(rule: DisableFunctionTraceRule, event: TraceEventForFilter)
 }
 
 function shouldDropTraceEvent(event: TraceEventForFilter): boolean {
+    if (disabledTraceFilePatterns.length) {
+        if (matchesPattern(event.file, disabledTraceFilePatterns, false)) {
+            return true;
+        }
+    }
     if (disabledFunctionTypePatterns.length) {
         if (matchesPattern(event.functionType, disabledFunctionTypePatterns, false)) {
             return true;
@@ -234,6 +247,29 @@ export function setDisabledFunctionTraces(rules?: DisableFunctionTraceConfig[] |
 
 export function setDisabledFunctionTypes(patterns?: TraceRulePattern | null) {
     disabledFunctionTypePatterns = normalizePatternArray(patterns);
+}
+
+function flattenTraceFilePatterns(config: DisableTraceFileConfig): Array<string | RegExp> {
+    if (config === null || config === undefined) return [];
+    if (Array.isArray(config)) {
+        return config.flatMap(entry => flattenTraceFilePatterns(entry));
+    }
+    if (config instanceof RegExp || typeof config === 'string') {
+        return [config];
+    }
+    if (typeof config === 'object' && 'file' in config) {
+        return normalizePatternArray(config.file);
+    }
+    return [];
+}
+
+export function setDisabledTraceFiles(config?: DisableTraceFileConfig | DisableTraceFileConfig[] | null) {
+    if (config === null || config === undefined) {
+        disabledTraceFilePatterns = [];
+        return;
+    }
+    const items = Array.isArray(config) ? config : [config];
+    disabledTraceFilePatterns = items.flatMap(entry => flattenTraceFilePatterns(entry)).filter(Boolean);
 }
 
 function applyTraceLogPreference(tracer?: TracerApi | null) {
@@ -314,6 +350,11 @@ export type ReproTracingInitOptions = TracerInitOpts & {
      */
     disableFunctionTypes?: TraceRulePattern | null;
     /**
+     * Prevents traces emitted from specific files. Accepts glob-like substrings
+     * or regular expressions, or the {@link DisableTraceByFilename} helper.
+     */
+    disableTraceFiles?: DisableTraceFileConfig | DisableTraceFileConfig[] | null;
+    /**
      * Enables or silences console logs emitted by the tracer when functions
      * are entered/exited. Equivalent to calling `setReproTraceLogsEnabled`.
      */
@@ -351,6 +392,9 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
     if (hasOwn(options, 'disableFunctionTraces')) {
         setDisabledFunctionTraces(options.disableFunctionTraces ?? null);
     }
+    if (hasOwn(options, 'disableTraceFiles')) {
+        setDisabledTraceFiles(options.disableTraceFiles ?? null);
+    }
     if (hasOwn(options, 'logFunctionCalls') && typeof options.logFunctionCalls === 'boolean') {
         setReproTraceLogsEnabled(options.logFunctionCalls);
     }
@@ -368,6 +412,7 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
         const {
             disableFunctionTraces: _disableFunctionTraces,
             disableFunctionTypes: _disableFunctionTypes,
+            disableTraceFiles: _disableTraceFiles,
             logFunctionCalls: _logFunctionCalls,
             ...rest
         } = options;
