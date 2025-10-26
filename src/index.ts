@@ -84,6 +84,8 @@ type TracerApi = {
     setFunctionLogsEnabled?: (enabled: boolean) => void;
 };
 
+const REQUEST_START_HEADER = 'x-bug-request-start';
+
 function escapeRx(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 let __TRACER__: TracerApi | null = null;
 let __TRACER_READY = false;
@@ -387,9 +389,25 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
 /** Optional helper if users want to check it. */
 export function isReproTracingEnabled() { return __TRACER_READY; }
 
-type Ctx = { sid?: string; aid?: string };
+type Ctx = { sid?: string; aid?: string; clockSkewMs?: number };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
+
+function currentClockSkewMs(): number {
+    const store = als.getStore();
+    const skew = store?.clockSkewMs;
+    return Number.isFinite(skew) ? Number(skew) : 0;
+}
+
+function alignTimestamp(ms: number): number {
+    if (!Number.isFinite(ms)) return ms;
+    const skew = currentClockSkewMs();
+    return Number.isFinite(skew) ? ms + skew : ms;
+}
+
+function alignedNow(): number {
+    return alignTimestamp(Date.now());
+}
 
 function getCollectionNameFromDoc(doc: any): string | undefined {
     const direct =
@@ -453,6 +471,15 @@ async function post(apiBase: string, appId: string, appSecret: string, sessionId
             body: JSON.stringify(body),
         });
     } catch { /* swallow in SDK */ }
+}
+
+function readHeaderNumber(value: string | string[] | undefined): number | null {
+    const raw = Array.isArray(value) ? value[0] : value;
+    if (typeof raw !== 'string') return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
 }
 
 // -------- helpers for response capture & grouping --------
@@ -610,8 +637,11 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         const aid = (req.headers['x-bug-action-id'] as string) || '';
         if (!sid || !aid) return next(); // only capture tagged requests
 
-        const t0 = Date.now();
-        const rid = String(t0);
+        const requestStartRaw = Date.now();
+        const headerTs = readHeaderNumber(req.headers[REQUEST_START_HEADER]);
+        const clockSkewMs = headerTs !== null ? headerTs - requestStartRaw : 0;
+        const rid = String(headerTs !== null ? headerTs : requestStartRaw + clockSkewMs);
+        const t0 = requestStartRaw;
         const url = (req as any).originalUrl || req.url || '/';
         const path = url; // back-compat
         const key = normalizeRouteKey(req.method, url);
@@ -636,7 +666,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
         (res as any).end = (chunk?: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origEnd(chunk, ...args); };
 
         // ---- our ALS (unchanged) ----
-        als.run({ sid, aid }, () => {
+        als.run({ sid, aid, clockSkewMs }, () => {
             // subscribe to tracer for this request (passive only)
             const events: Array<{
                 t: number;
@@ -662,7 +692,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                         unsubscribe = __TRACER__.tracer.on((ev: any) => {
                             if (ev && ev.traceId === tidNow) {
                                 const evt: typeof events[number] = {
-                                    t: ev.t,
+                                    t: alignTimestamp(ev.t),
                                     type: ev.type,
                                     fn: ev.fn,
                                     file: ev.file,
@@ -733,7 +763,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                             respBody: capturedBody,
                             trace: traceBatches.length ? undefined : '[]',
                         },
-                        t: Date.now(),
+                        t: alignedNow(),
                     }]
                 });
                 console.log('traceBatches --->', traceBatches)
@@ -756,7 +786,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                                     index: i,
                                     total: traceBatches.length,
                                 },
-                                t: Date.now(),
+                                t: alignedNow(),
                             }],
                         });
                         console.log('inside post --->')
@@ -819,7 +849,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 entries: [{
                     actionId: (getCtx() as Ctx).aid!,
                     db: [{ collection, pk: { _id: (this as any)._id }, before, after, op: meta.wasNew ? 'insert' : 'update', query }],
-                    t: Date.now(),
+                    t: alignedNow(),
                 }]
             });
         });
@@ -851,7 +881,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 entries: [{
                     actionId: (getCtx() as Ctx).aid!,
                     db: [{ collection, pk: { _id: pk }, before, after, op: after && before ? 'update' : after ? 'insert' : 'update' }],
-                    t: Date.now()
+                    t: alignedNow()
                 }]
             });
         });
@@ -878,7 +908,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 entries: [{
                     actionId: (getCtx() as Ctx).aid!,
                     db: [{ collection, pk: { _id: before._id }, before, after: null, op: 'delete', query: { filter } }],
-                    t: Date.now()
+                    t: alignedNow()
                 }]
             });
         });
@@ -931,7 +961,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                     query: { filter: meta.filter, update: meta.update, projection: meta.projection, options: meta.options },
                     resultMeta,
                     durMs: Date.now() - meta.t0,
-                    t: Date.now(),
+                    t: alignedNow(),
                 });
             });
         }
@@ -970,7 +1000,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 query: { pipeline: meta.pipeline },
                 resultMeta,
                 durMs: Date.now() - meta.t0,
-                t: Date.now(),
+                t: alignedNow(),
             });
         });
     };
@@ -1138,7 +1168,7 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
                     attachmentsMeta: norm.attachmentsMeta,
                     statusCode, durMs: Date.now() - t0, headers: headers ?? {},
                 },
-                t: Date.now(),
+                t: alignedNow(),
             }]
         });
     }
