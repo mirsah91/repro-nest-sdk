@@ -508,11 +508,23 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
     return name;
 }
 
-async function post(apiBase: string, appId: string, appSecret: string, sessionId: string, body: any) {
+async function post(
+    apiBase: string,
+    tenantId: string,
+    appId: string,
+    appSecret: string,
+    sessionId: string,
+    body: any,
+) {
     try {
         await fetch(`${apiBase}/v1/sessions/${sessionId}/backend`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-App-Id': appId, 'X-App-Secret': appSecret },
+            headers: {
+                'Content-Type': 'application/json',
+                'X-App-Id': appId,
+                'X-App-Secret': appSecret,
+                'X-Tenant-Id': tenantId,
+            },
             body: JSON.stringify(body),
         });
     } catch { /* swallow in SDK */ }
@@ -688,7 +700,7 @@ function sanitizeTraceArgs(values: any): any {
 // ===================================================================
 // reproMiddleware — unchanged behavior + passive per-request trace
 // ===================================================================
-export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: string }) {
+export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecret: string; apiBase: string }) {
     return function (req: Request, res: Response, next: NextFunction) {
         const sid = (req.headers['x-bug-session-id'] as string) || '';
         const aid = (req.headers['x-bug-action-id'] as string) || '';
@@ -805,7 +817,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 
                 const traceBatches = chunkArray(events, TRACE_BATCH_SIZE);
 
-                post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
+                post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
                         request: {
@@ -834,7 +846,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
                         let traceStr = '[]';
                         try { traceStr = JSON.stringify(batch); } catch {}
 
-                        post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
+                        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
                             entries: [{
                                 actionId: aid,
                                 trace: traceStr,
@@ -865,7 +877,7 @@ export function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase
 //   - ONLY schema middleware (pre/post) for specific ops
 //   - keeps your existing doc-diff hooks
 // ===================================================================
-export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; apiBase: string }) {
+export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appSecret: string; apiBase: string }) {
     return function (schema: Schema) {
         // -------- pre/post save (unchanged) --------
         schema.pre('save', { document: true }, async function (next) {
@@ -902,7 +914,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
                 ? { op: 'insertOne', doc: after }
                 : { filter: { _id: this._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
 
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
+            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
                     actionId: (getCtx() as Ctx).aid!,
                     db: [{ collection, pk: { _id: (this as any)._id }, before, after, op: meta.wasNew ? 'insert' : 'update', query }],
@@ -934,7 +946,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
             const pk = after?._id ?? before?._id;
 
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
+            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
                     actionId: (getCtx() as Ctx).aid!,
                     db: [{ collection, pk: { _id: pk }, before, after, op: after && before ? 'update' : after ? 'insert' : 'update' }],
@@ -961,7 +973,7 @@ export function reproMongoosePlugin(cfg: { appId: string; appSecret: string; api
             if (!before) return;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
             const filter = (this as any).__repro_filter ?? { _id: before._id };
-            post(cfg.apiBase, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
+            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
                     actionId: (getCtx() as Ctx).aid!,
                     db: [{ collection, pk: { _id: before._id }, before, after: null, op: 'delete', query: { filter } }],
@@ -1150,7 +1162,7 @@ function dehydrateComplexValue(value: any) {
 
 function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
     if (!sid) return;
-    post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
+    post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
         entries: [{
             actionId: aid ?? null,
             db: [{
@@ -1209,6 +1221,7 @@ function buildMinimalUpdate(before: any, after: any) {
 // ===================================================================
 export type SendgridPatchConfig = {
     appId: string;
+    tenantId: string;
     appSecret: string;
     apiBase: string;
     resolveContext?: () => { sid?: string; aid?: string } | undefined;
@@ -1265,7 +1278,7 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
         if (!sid) return;
 
         const norm = normalizeSendgridMessage(rawMsg);
-        post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
+        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
             entries: [{
                 actionId: aid ?? null,
                 email: {
