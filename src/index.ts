@@ -697,6 +697,20 @@ function sanitizeTraceArgs(values: any): any {
     return values.map(v => sanitizeTraceValue(v));
 }
 
+function sanitizeRequestSnapshot(value: any) {
+    if (value === undefined) return undefined;
+    try {
+        return sanitizeTraceValue(value);
+    } catch {
+        if (value === null) return null;
+        if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+            return value;
+        }
+        try { return JSON.parse(JSON.stringify(value)); } catch {}
+        try { return String(value); } catch { return undefined; }
+    }
+}
+
 // ===================================================================
 // reproMiddleware — unchanged behavior + passive per-request trace
 // ===================================================================
@@ -816,22 +830,30 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                 }
 
                 const traceBatches = chunkArray(events, TRACE_BATCH_SIZE);
+                const requestBody = sanitizeRequestSnapshot((req as any).body);
+                const requestParams = sanitizeRequestSnapshot((req as any).params);
+                const requestQuery = sanitizeRequestSnapshot((req as any).query);
+
+                const requestPayload: Record<string, any> = {
+                    rid,
+                    method: req.method,
+                    url,
+                    path,
+                    status: res.statusCode,
+                    durMs: Date.now() - t0,
+                    headers: {},
+                    key,
+                    respBody: capturedBody,
+                    trace: traceBatches.length ? undefined : '[]',
+                };
+                if (requestBody !== undefined) requestPayload.body = requestBody;
+                if (requestParams !== undefined) requestPayload.params = requestParams;
+                if (requestQuery !== undefined) requestPayload.query = requestQuery;
 
                 post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
                         actionId: aid,
-                        request: {
-                            rid,
-                            method: req.method,
-                            url,
-                            path,
-                            status: res.statusCode,
-                            durMs: Date.now() - t0,
-                            headers: {},
-                            key,
-                            respBody: capturedBody,
-                            trace: traceBatches.length ? undefined : '[]',
-                        },
+                        request: requestPayload,
                         t: alignedNow(),
                     }]
                 });
