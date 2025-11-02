@@ -7,11 +7,23 @@ export const getCtx = () => als.getStore() || {};
 
 // If you already export als/getCtx from repro-node, reuse that instead of re-declaring.
 
-async function post(apiBase: string, appId: string, appSecret: string, sessionId: string, body: any) {
+async function post(
+    apiBase: string,
+    tenantId: string,
+    appId: string,
+    appSecret: string,
+    sessionId: string,
+    body: any,
+) {
     try {
         await fetch(`${apiBase}/v1/sessions/${sessionId}/backend`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-App-Id': appId, 'X-App-Secret': appSecret },
+            headers: {
+                'Content-Type': 'application/json',
+                'X-App-Id': appId,
+                'X-App-Secret': appSecret,
+                'X-Tenant-Id': tenantId,
+            },
             body: JSON.stringify(body),
         });
     } catch { /* swallow */ }
@@ -19,6 +31,7 @@ async function post(apiBase: string, appId: string, appSecret: string, sessionId
 
 export type SendgridPatchConfig = {
     appId: string;
+    tenantId: string;
     appSecret: string;
     apiBase: string;
     // Optional: provide a function to resolve sid/aid if AsyncLocalStorage is not set
@@ -107,7 +120,7 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
             t: Date.now(),
         };
 
-        post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, { entries: [entry] });
+        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, { entries: [entry] });
     }
 
     function normalizeAddress(a: any): { email: string; name?: string } | null {
