@@ -593,11 +593,47 @@ function normalizeRouteKey(method: string, rawPath: string) {
     return `${String(method || 'GET').toUpperCase()} ${base}`;
 }
 
+function normalizeFilePath(file?: string | null): string {
+    return file ? String(file).replace(/\\/g, '/').toLowerCase() : '';
+}
+
 function isLikelyAppFile(file?: string | null): boolean {
     if (!file) return false;
     const normalized = String(file).replace(/\\/g, '/');
     if (!normalized) return false;
     return !normalized.includes('/node_modules/');
+}
+
+function isLikelyNestControllerFile(file?: string | null): boolean {
+    const normalized = normalizeFilePath(file);
+    if (!normalized) return false;
+    if (!isLikelyAppFile(file)) return false;
+    return (
+        normalized.includes('.controller.') ||
+        normalized.includes('/controllers/') ||
+        normalized.includes('.resolver.') ||
+        normalized.includes('/resolvers/')
+    );
+}
+
+function isLikelyNestGuardFile(file?: string | null): boolean {
+    const normalized = normalizeFilePath(file);
+    if (!normalized) return false;
+    return normalized.includes('.guard.') || normalized.includes('/guards/');
+}
+
+function toEndpointTrace(evt: {
+    fn?: string;
+    file?: string;
+    line?: number | null;
+    functionType?: string | null;
+}): EndpointTraceInfo {
+    return {
+        fn: evt.fn ?? null,
+        file: evt.file ?? null,
+        line: evt.line ?? null,
+        functionType: evt.functionType ?? null,
+    };
 }
 
 function coerceBodyToStorable(body: any, contentType?: string | number | string[]) {
@@ -820,6 +856,8 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                 error?: any;
             }> = [];
             let endpointTrace: EndpointTraceInfo | null = null;
+            let preferredAppTrace: EndpointTraceInfo | null = null;
+            let firstAppTrace: EndpointTraceInfo | null = null;
             let unsubscribe: undefined | (() => void);
 
             try {
@@ -870,18 +908,19 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                                     return;
                                 }
 
-                                if (
-                                    !endpointTrace &&
-                                    evt.type === 'enter' &&
-                                    isLikelyAppFile(evt.file) &&
-                                    (evt.depth === undefined || evt.depth <= 2)
-                                ) {
-                                    endpointTrace = {
-                                        fn: evt.fn ?? null,
-                                        file: evt.file ?? null,
-                                        line: evt.line ?? null,
-                                        functionType: evt.functionType ?? null,
-                                    };
+                                if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
+                                    const depthOk = evt.depth === undefined || evt.depth <= 6;
+                                    const trace = toEndpointTrace(evt);
+
+                                    if (depthOk && !firstAppTrace) {
+                                        firstAppTrace = trace;
+                                    }
+
+                                    if (isLikelyNestControllerFile(evt.file)) {
+                                        endpointTrace = trace;
+                                    } else if (depthOk && !preferredAppTrace && !isLikelyNestGuardFile(evt.file)) {
+                                        preferredAppTrace = trace;
+                                    }
                                 }
 
                                 events.push(evt);
@@ -919,12 +958,10 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                 if (requestBody !== undefined) requestPayload.body = requestBody;
                 if (requestParams !== undefined) requestPayload.params = requestParams;
                 if (requestQuery !== undefined) requestPayload.query = requestQuery;
-                const entryPointPayload = endpointTrace ?? {
-                    fn: null,
-                    file: null,
-                    line: null,
-                    functionType: null,
-                };
+                const entryPointPayload = endpointTrace
+                    ?? preferredAppTrace
+                    ?? firstAppTrace
+                    ?? { fn: null, file: null, line: null, functionType: null };
                 requestPayload.entryPoint = entryPointPayload;
 
                 post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
