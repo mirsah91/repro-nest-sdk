@@ -103,6 +103,13 @@ export type TraceEventForFilter = {
     library?: string | null;
 };
 
+type EndpointTraceInfo = {
+    fn: string | null;
+    file: string | null;
+    line: number | null;
+    functionType: string | null;
+};
+
 /** Lightweight helper to disable every trace emitted from specific files. */
 export interface DisableTraceByFilename {
     file: TraceRulePattern;
@@ -144,10 +151,41 @@ export type DisableFunctionTraceConfig =
     | DisableFunctionTraceRule
     | DisableFunctionTracePredicate;
 
-let disabledFunctionTraceRules: DisableFunctionTraceConfig[] = [];
+const DEFAULT_INTERCEPTOR_TRACE_RULES: DisableFunctionTraceConfig[] = [
+    { fn: /switchToHttp$/i },
+    { fn: /intercept$/i },
+];
+
+let interceptorTracingEnabled = false;
+let userDisabledFunctionTraceRules: DisableFunctionTraceConfig[] | null = null;
+
+function computeDisabledFunctionTraceRules(
+    rules?: DisableFunctionTraceConfig[] | null,
+): DisableFunctionTraceConfig[] {
+    const normalized = Array.isArray(rules)
+        ? rules.filter((rule): rule is DisableFunctionTraceConfig => !!rule)
+        : [];
+    if (interceptorTracingEnabled) {
+        return normalized;
+    }
+    return [...DEFAULT_INTERCEPTOR_TRACE_RULES, ...normalized];
+}
+
+function refreshDisabledFunctionTraceRules() {
+    disabledFunctionTraceRules = computeDisabledFunctionTraceRules(userDisabledFunctionTraceRules);
+}
+
+let disabledFunctionTraceRules: DisableFunctionTraceConfig[] = computeDisabledFunctionTraceRules();
 let disabledFunctionTypePatterns: Array<string | RegExp> = [];
 let disabledTraceFilePatterns: Array<string | RegExp> = [];
 let __TRACE_LOG_PREF: boolean | null = null;
+
+function setInterceptorTracingEnabled(enabled: boolean) {
+    const next = !!enabled;
+    if (interceptorTracingEnabled === next) return;
+    interceptorTracingEnabled = next;
+    refreshDisabledFunctionTraceRules();
+}
 
 function hasOwn(obj: unknown, key: string): boolean {
     return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
@@ -239,10 +277,11 @@ function shouldDropTraceEvent(event: TraceEventForFilter): boolean {
 
 export function setDisabledFunctionTraces(rules?: DisableFunctionTraceConfig[] | null) {
     if (!rules || !Array.isArray(rules)) {
-        disabledFunctionTraceRules = [];
-        return;
+        userDisabledFunctionTraceRules = null;
+    } else {
+        userDisabledFunctionTraceRules = rules.filter((rule): rule is DisableFunctionTraceConfig => !!rule);
     }
-    disabledFunctionTraceRules = rules.filter((rule): rule is DisableFunctionTraceConfig => !!rule);
+    refreshDisabledFunctionTraceRules();
 }
 
 export function setDisabledFunctionTypes(patterns?: TraceRulePattern | null) {
@@ -355,6 +394,11 @@ export type ReproTracingInitOptions = TracerInitOpts & {
      */
     disableTraceFiles?: DisableTraceFileConfig | DisableTraceFileConfig[] | null;
     /**
+     * When `false` (default) Nest interceptors are stripped from traces.
+     * Set to `true` to include them if you need to debug interceptor logic.
+     */
+    traceInterceptors?: boolean;
+    /**
      * Enables or silences console logs emitted by the tracer when functions
      * are entered/exited. Equivalent to calling `setReproTraceLogsEnabled`.
      */
@@ -386,6 +430,9 @@ function defaultTracerInitOpts(): TracerInitOpts {
 export function initReproTracing(opts?: ReproTracingInitOptions) {
     const options = opts ?? {};
 
+    if (hasOwn(options, 'traceInterceptors')) {
+        setInterceptorTracingEnabled(!!options.traceInterceptors);
+    }
     if (hasOwn(options, 'disableFunctionTypes')) {
         setDisabledFunctionTypes(options.disableFunctionTypes ?? null);
     }
@@ -414,6 +461,7 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
             disableFunctionTypes: _disableFunctionTypes,
             disableTraceFiles: _disableTraceFiles,
             logFunctionCalls: _logFunctionCalls,
+            traceInterceptors: _traceInterceptors,
             ...rest
         } = options;
         const initOpts = { ...defaultTracerInitOpts(), ...(rest as TracerInitOpts) };
@@ -543,6 +591,13 @@ function readHeaderNumber(value: string | string[] | undefined): number | null {
 function normalizeRouteKey(method: string, rawPath: string) {
     const base = (rawPath || '/').split('?')[0] || '/';
     return `${String(method || 'GET').toUpperCase()} ${base}`;
+}
+
+function isLikelyAppFile(file?: string | null): boolean {
+    if (!file) return false;
+    const normalized = String(file).replace(/\\/g, '/');
+    if (!normalized) return false;
+    return !normalized.includes('/node_modules/');
 }
 
 function coerceBodyToStorable(body: any, contentType?: string | number | string[]) {
@@ -764,6 +819,7 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                 threw?: boolean;
                 error?: any;
             }> = [];
+            let endpointTrace: EndpointTraceInfo | null = null;
             let unsubscribe: undefined | (() => void);
 
             try {
@@ -814,6 +870,20 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                                     return;
                                 }
 
+                                if (
+                                    !endpointTrace &&
+                                    evt.type === 'enter' &&
+                                    isLikelyAppFile(evt.file) &&
+                                    (evt.depth === undefined || evt.depth <= 2)
+                                ) {
+                                    endpointTrace = {
+                                        fn: evt.fn ?? null,
+                                        file: evt.file ?? null,
+                                        line: evt.line ?? null,
+                                        functionType: evt.functionType ?? null,
+                                    };
+                                }
+
                                 events.push(evt);
                             }
                         });
@@ -849,6 +919,13 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                 if (requestBody !== undefined) requestPayload.body = requestBody;
                 if (requestParams !== undefined) requestPayload.params = requestParams;
                 if (requestQuery !== undefined) requestPayload.query = requestQuery;
+                const entryPointPayload = endpointTrace ?? {
+                    fn: null,
+                    file: null,
+                    line: null,
+                    functionType: null,
+                };
+                requestPayload.entryPoint = entryPointPayload;
 
                 post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
                     entries: [{
