@@ -840,10 +840,10 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
         (res as any).end = (chunk?: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origEnd(chunk, ...args); };
 
         // ---- our ALS (unchanged) ----
-        const tracerApi = __TRACER__ || null;
+        const tracerApiWithTrace = __TRACER__ as (TracerApi & { withTrace?: (id: string, fn: () => void) => void }) | null;
         const runInTrace = (fn: () => void) => {
-            if (tracerApi?.withTrace) {
-                return tracerApi.withTrace(rid, fn);
+            if (tracerApiWithTrace?.withTrace) {
+                return tracerApiWithTrace.withTrace(rid, fn);
             }
             return fn();
         };
