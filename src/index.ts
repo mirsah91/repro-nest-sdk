@@ -854,6 +854,7 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                 returnValue?: any;
                 threw?: boolean;
                 error?: any;
+                unawaited?: boolean;
             }> = [];
             let endpointTrace: EndpointTraceInfo | null = null;
             let preferredAppTrace: EndpointTraceInfo | null = null;
@@ -892,6 +893,9 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                                 }
                                 if (ev.threw !== undefined) {
                                     evt.threw = Boolean(ev.threw);
+                                }
+                                if (ev.unawaited !== undefined) {
+                                    evt.unawaited = ev.unawaited === true;
                                 }
 
                                 const candidate: TraceEventForFilter = {
