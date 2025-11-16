@@ -71,8 +71,12 @@ const trace = {
             args: detail?.args,
             returnValue: detail?.returnValue,
             error: detail?.error,
-            threw: detail?.threw === true
+            threw: detail?.threw === true,
+            unawaited: detail?.unawaited === true
         };
+
+        const promiseTaggedUnawaited = !!(baseDetail.returnValue && baseDetail.returnValue[SYM_UNAWAITED]);
+        const forceUnawaited = baseDetail.unawaited || promiseTaggedUnawaited;
 
         const emitExit = (overrides = {}) => {
             const finalDetail = {
@@ -85,6 +89,9 @@ const trace = {
                 error: overrides.hasOwnProperty('error')
                     ? overrides.error
                     : baseDetail.error,
+                unawaited: overrides.hasOwnProperty('unawaited')
+                    ? overrides.unawaited
+                    : forceUnawaited,
                 args: overrides.hasOwnProperty('args')
                     ? overrides.args
                     : baseDetail.args
@@ -102,7 +109,8 @@ const trace = {
                 returnValue: finalDetail.returnValue,
                 threw: finalDetail.threw === true,
                 error: finalDetail.error,
-                args: finalDetail.args
+                args: finalDetail.args,
+                unawaited: finalDetail.unawaited === true
             });
         };
 
@@ -110,9 +118,9 @@ const trace = {
 
         if (!baseDetail.threw) {
             const rv = baseDetail.returnValue;
-            if (isThenable(rv)) {
+            if (isThenable(rv) && !forceUnawaited) {
                 if (isMongooseQuery(rv)) {
-                    emitExit();
+                    emitExit({ unawaited: false });
                     return;
                 }
 
@@ -136,7 +144,7 @@ const trace = {
             }
         }
 
-        emitExit();
+        emitExit({ unawaited: forceUnawaited });
     }
 };
 global.__trace = trace; // called by injected code
@@ -145,6 +153,7 @@ global.__trace = trace; // called by injected code
 const SYM_SRC_FILE = Symbol.for('__repro_src_file'); // function's defining file (set by require hook)
 const SYM_IS_APP   = Symbol.for('__repro_is_app');   // boolean: true if function is from app code
 const SYM_SKIP_WRAP= Symbol.for('__repro_skip_wrap'); // guard to avoid wrapping our own helpers
+const SYM_UNAWAITED = Symbol.for('__repro_unawaited');
 
 function emit(ev){
     if (EMITTING) return;
@@ -278,19 +287,32 @@ if (functionLogsEnabled) ensureFunctionLogger();
 
 function short(p){ try{ const cwd = process.cwd().replace(/\\/g,'/'); return String(p).replace(cwd+'/',''); } catch { return p; } }
 
+function markPromiseUnawaited(value) {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return;
+    try {
+        Object.defineProperty(value, SYM_UNAWAITED, { value: true, configurable: true });
+    } catch {
+        try { value[SYM_UNAWAITED] = true; } catch {}
+    }
+}
+
 // ========= Generic call-site shim (used by Babel transform) =========
 // Decides whether to emit a top-level event based on callee origin tags.
 // No hardcoded library names or file paths.
 if (!global.__repro_call) {
     Object.defineProperty(global, '__repro_call', {
-        value: function __repro_call(fn, thisArg, args, callFile, callLine, label) {
+        value: function __repro_call(fn, thisArg, args, callFile, callLine, label, isUnawaitedCall) {
             try {
                 if (typeof fn !== 'function' || fn[SYM_SKIP_WRAP]) {
                     return fn.apply(thisArg, args);
                 }
 
                 const isApp = fn[SYM_IS_APP] === true;
-                if (isApp) return fn.apply(thisArg, args);
+                if (isApp) {
+                    const out = fn.apply(thisArg, args);
+                    if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
+                    return out;
+                }
 
                 const name = (label && label.length) || fn.name
                     ? (label && label.length ? label : fn.name)
@@ -305,14 +327,19 @@ if (!global.__repro_call) {
                 try {
                     const out = fn.apply(thisArg, args);
 
-                    const exitDetailBase = { returnValue: out, args };
-
-                    // --- classify the return value ---
                     const isThenableValue = isThenable(out);
                     const isQuery = isMongooseQuery(out);
+                    const shouldForceExit = !!isUnawaitedCall && isThenableValue;
+                    const exitDetailBase = {
+                        returnValue: out,
+                        args,
+                        unawaited: shouldForceExit
+                    };
+
+                    if (shouldForceExit) markPromiseUnawaited(out);
 
                     if (isThenableValue) {
-                        if (isQuery) {
+                        if (isQuery || shouldForceExit) {
                             trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
                             return out;
                         }
