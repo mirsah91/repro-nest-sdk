@@ -103,14 +103,7 @@ export type TraceEventForFilter = {
     library?: string | null;
 };
 
-type EndpointTraceInfo = {
-    fn: string | null;
-    file: string | null;
-    line: number | null;
-    functionType: string | null;
-};
-
-type CapturedTraceEvent = {
+type TraceEventRecord = {
     t: number;
     type: 'enter' | 'exit';
     functionType?: string | null;
@@ -125,8 +118,12 @@ type CapturedTraceEvent = {
     unawaited?: boolean;
 };
 
-const activeTraceBuffers = new Map<string, CapturedTraceEvent[]>();
-let traceListenerInstalled = false;
+type EndpointTraceInfo = {
+    fn: string | null;
+    file: string | null;
+    line: number | null;
+    functionType: string | null;
+};
 
 /** Lightweight helper to disable every trace emitted from specific files. */
 export interface DisableTraceByFilename {
@@ -343,93 +340,7 @@ export function enableReproTraceLogs() { setReproTraceLogsEnabled(true); }
 
 export function disableReproTraceLogs() { setReproTraceLogsEnabled(false); }
 
-function ensureGlobalTraceListener() {
-    if (traceListenerInstalled) return;
-    if (!__TRACER__?.tracer?.on) return;
-
-    __TRACER__.tracer.on((ev: any) => {
-        const rid = ev?.traceId;
-        if (!rid) return;
-
-        const buffer = activeTraceBuffers.get(rid);
-        if (!buffer) return;
-
-        const normalized = normalizeTraceEvent(ev);
-        if (!normalized) return;
-
-        buffer.push(normalized);
-    });
-
-    traceListenerInstalled = true;
-}
-
-function normalizeTraceEvent(ev: any): CapturedTraceEvent | null {
-    if (!ev || (ev.type !== 'enter' && ev.type !== 'exit')) return null;
-    const evt: CapturedTraceEvent = {
-        t: alignTimestamp(ev.t),
-        type: ev.type,
-        fn: ev.fn,
-        file: ev.file,
-        line: ev.line,
-        depth: ev.depth,
-    };
-
-    if (ev.functionType !== undefined) {
-        evt.functionType = ev.functionType;
-    }
-
-    if (ev.args !== undefined) {
-        evt.args = sanitizeTraceArgs(ev.args);
-    }
-    if (ev.returnValue !== undefined) {
-        evt.returnValue = sanitizeTraceValue(ev.returnValue);
-    }
-    if (ev.error !== undefined) {
-        evt.error = sanitizeTraceValue(ev.error);
-    }
-    if (ev.threw !== undefined) {
-        evt.threw = Boolean(ev.threw);
-    }
-    if (ev.unawaited !== undefined) {
-        evt.unawaited = ev.unawaited === true;
-    }
-
-    const candidate: TraceEventForFilter = {
-        type: evt.type,
-        eventType: evt.type,
-        functionType: evt.functionType ?? null,
-        fn: evt.fn,
-        file: evt.file ?? null,
-        depth: evt.depth,
-        library: inferLibraryNameFromFile(evt.file),
-    };
-
-    if (shouldDropTraceEvent(candidate)) {
-        return null;
-    }
-
-    return evt;
-}
-
-function acquireTraceBuffer(traceId: string): CapturedTraceEvent[] {
-    let buf = activeTraceBuffers.get(traceId);
-    if (!buf) {
-        buf = [];
-        activeTraceBuffers.set(traceId, buf);
-    }
-    return buf;
-}
-
-function releaseTraceBuffer(traceId: string): CapturedTraceEvent[] {
-    const buf = activeTraceBuffers.get(traceId);
-    if (buf) {
-        activeTraceBuffers.delete(traceId);
-        return buf;
-    }
-    return [];
-}
-
-function summarizeEndpointFromEvents(events: CapturedTraceEvent[]) {
+function summarizeEndpointFromEvents(events: TraceEventRecord[]) {
     let endpointTrace: EndpointTraceInfo | null = null;
     let preferredAppTrace: EndpointTraceInfo | null = null;
     let firstAppTrace: EndpointTraceInfo | null = null;
@@ -597,7 +508,6 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
         tracerPkg.init?.(initOpts);
         tracerPkg.patchHttp?.();
         applyTraceLogPreference(tracerPkg);
-        ensureGlobalTraceListener();
         __TRACER_READY = true;
     } catch {
         __TRACER__ = null; // SDK still works without tracer
@@ -632,7 +542,7 @@ function alignedNow(): number {
     return alignTimestamp(Date.now());
 }
 
-function balanceTraceEvents(events: CapturedTraceEvent[]): CapturedTraceEvent[] {
+function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
     if (!Array.isArray(events) || events.length === 0) return events;
 
     const openByKey = new Map<string, Array<typeof events[number]>>();
@@ -1034,9 +944,85 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
             return fn();
         };
 
-        acquireTraceBuffer(rid);
-
         runInTrace(() => als.run({ sid, aid, clockSkewMs }, () => {
+            const events: TraceEventRecord[] = [];
+            let endpointTrace: EndpointTraceInfo | null = null;
+            let preferredAppTrace: EndpointTraceInfo | null = null;
+            let firstAppTrace: EndpointTraceInfo | null = null;
+            let unsubscribe: undefined | (() => void);
+
+            try {
+                if (__TRACER__?.tracer?.on) {
+                    const getTid = __TRACER__?.getCurrentTraceId;
+                    const tidNow = getTid ? getTid() : null;
+                    if (tidNow) {
+                        unsubscribe = __TRACER__.tracer.on((ev: any) => {
+                            if (!ev || ev.traceId !== tidNow) return;
+
+                            const evt: TraceEventRecord = {
+                                t: alignTimestamp(ev.t),
+                                type: ev.type,
+                                fn: ev.fn,
+                                file: ev.file,
+                                line: ev.line,
+                                depth: ev.depth,
+                            };
+
+                            if (ev.functionType !== undefined) {
+                                evt.functionType = ev.functionType;
+                            }
+
+                            if (ev.args !== undefined) {
+                                evt.args = sanitizeTraceArgs(ev.args);
+                            }
+                            if (ev.returnValue !== undefined) {
+                                evt.returnValue = sanitizeTraceValue(ev.returnValue);
+                            }
+                            if (ev.error !== undefined) {
+                                evt.error = sanitizeTraceValue(ev.error);
+                            }
+                            if (ev.threw !== undefined) {
+                                evt.threw = Boolean(ev.threw);
+                            }
+                            if (ev.unawaited !== undefined) {
+                                evt.unawaited = ev.unawaited === true;
+                            }
+
+                            const candidate: TraceEventForFilter = {
+                                type: evt.type,
+                                eventType: evt.type,
+                                functionType: evt.functionType ?? null,
+                                fn: evt.fn,
+                                file: evt.file ?? null,
+                                depth: evt.depth,
+                                library: inferLibraryNameFromFile(evt.file),
+                            };
+
+                            if (shouldDropTraceEvent(candidate)) {
+                                return;
+                            }
+
+                            if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
+                                const depthOk = evt.depth === undefined || evt.depth <= 6;
+                                const trace = toEndpointTrace(evt);
+
+                                if (depthOk && !firstAppTrace) {
+                                    firstAppTrace = trace;
+                                }
+
+                                if (isLikelyNestControllerFile(evt.file)) {
+                                    endpointTrace = trace;
+                                } else if (depthOk && !preferredAppTrace && !isLikelyNestGuardFile(evt.file)) {
+                                    preferredAppTrace = trace;
+                                }
+                            }
+
+                            events.push(evt);
+                        });
+                    }
+                }
+            } catch { /* never break user code */ }
+
             res.on('finish', () => {
                 if (capturedBody === undefined && chunks.length) {
                     const buf = Buffer.isBuffer(chunks[0])
@@ -1046,9 +1032,15 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                 }
 
                 const flushPayload = () => {
-                    const collectedEvents = releaseTraceBuffer(rid);
-                    const balancedEvents = balanceTraceEvents(collectedEvents);
-                    const { endpointTrace, preferredAppTrace, firstAppTrace } = summarizeEndpointFromEvents(balancedEvents);
+                    const balancedEvents = balanceTraceEvents(events.slice());
+                    const summary = summarizeEndpointFromEvents(balancedEvents);
+                    const chosenEndpoint = summary.endpointTrace
+                        ?? summary.preferredAppTrace
+                        ?? summary.firstAppTrace
+                        ?? endpointTrace
+                        ?? preferredAppTrace
+                        ?? firstAppTrace
+                        ?? { fn: null, file: null, line: null, functionType: null };
                     const traceBatches = chunkArray(balancedEvents, TRACE_BATCH_SIZE);
                     const requestBody = sanitizeRequestSnapshot((req as any).body);
                     const requestParams = sanitizeRequestSnapshot((req as any).params);
@@ -1069,11 +1061,7 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                     if (requestBody !== undefined) requestPayload.body = requestBody;
                     if (requestParams !== undefined) requestPayload.params = requestParams;
                     if (requestQuery !== undefined) requestPayload.query = requestQuery;
-                    const entryPointPayload = endpointTrace
-                        ?? preferredAppTrace
-                        ?? firstAppTrace
-                        ?? { fn: null, file: null, line: null, functionType: null };
-                    requestPayload.entryPoint = entryPointPayload;
+                    requestPayload.entryPoint = chosenEndpoint;
 
                     post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
                         entries: [{
@@ -1105,10 +1093,15 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                     }
                 };
 
-                if (__TRACER_READY) {
-                    setTimeout(flushPayload, TRACE_FLUSH_DELAY_MS);
-                } else {
+                const scheduleFlush = () => {
+                    try { unsubscribe && unsubscribe(); } catch {}
                     flushPayload();
+                };
+
+                if (__TRACER_READY) {
+                    setTimeout(scheduleFlush, TRACE_FLUSH_DELAY_MS);
+                } else {
+                    scheduleFlush();
                 }
             });
 
