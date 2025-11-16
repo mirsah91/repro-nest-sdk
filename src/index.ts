@@ -545,47 +545,45 @@ function alignedNow(): number {
 function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
     if (!Array.isArray(events) || events.length === 0) return events;
 
-    const openByKey = new Map<string, Array<typeof events[number]>>();
-    let lastT = events[events.length - 1]?.t ?? Date.now();
+    const makeKey = (ev: TraceEventRecord) =>
+        [ev.fn || '', ev.file || '', String(ev.line ?? ''), ev.functionType || ''].join('|');
 
-    const makeKey = (ev: typeof events[number]) => {
-        return [ev.fn || '', ev.file || '', String(ev.line ?? ''), ev.functionType || ''].join('|');
-    };
+    const seenKeys = new Set<string>();
+    const balanced: TraceEventRecord[] = [];
 
-    for (const ev of events) {
-        if (!ev || (ev.type !== 'enter' && ev.type !== 'exit')) continue;
-        if (typeof ev.t === 'number' && ev.t > lastT) lastT = ev.t;
+    for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (!ev || (ev.type !== 'enter' && ev.type !== 'exit')) {
+            balanced.push(ev);
+            continue;
+        }
+
+        balanced.push(ev);
+        if (ev.type !== 'enter') continue;
 
         const key = makeKey(ev);
-        if (!key) continue;
+        if (!key || seenKeys.has(key)) continue;
 
-        if (ev.type === 'enter') {
-            let stack = openByKey.get(key);
-            if (!stack) {
-                stack = [];
-                openByKey.set(key, stack);
+        let hasExit = false;
+        for (let j = i + 1; j < events.length; j++) {
+            const later = events[j];
+            if (later && later.type === 'exit' && makeKey(later) === key) {
+                hasExit = true;
+                break;
             }
-            stack.push(ev);
-        } else if (ev.type === 'exit') {
-            const stack = openByKey.get(key);
-            if (stack && stack.length) stack.pop();
         }
-    }
 
-    for (const [, stack] of openByKey.entries()) {
-        if (!stack || !stack.length) continue;
-        while (stack.length) {
-            const enterEv = stack.pop()!;
-            lastT += 1;
-            events.push({
-                t: lastT,
+        if (!hasExit) {
+            seenKeys.add(key);
+            balanced.push({
+                t: ev.t,
                 type: 'exit',
-                fn: enterEv.fn,
-                file: enterEv.file,
-                line: enterEv.line,
-                functionType: enterEv.functionType,
-                depth: typeof enterEv.depth === 'number' ? Math.max(0, enterEv.depth - 1) : enterEv.depth,
-                args: enterEv.args,
+                fn: ev.fn,
+                file: ev.file,
+                line: ev.line,
+                functionType: ev.functionType,
+                depth: typeof ev.depth === 'number' ? Math.max(0, ev.depth - 1) : ev.depth,
+                args: ev.args,
                 returnValue: undefined,
                 threw: false,
                 error: undefined,
@@ -594,7 +592,7 @@ function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
         }
     }
 
-    return events;
+    return balanced;
 }
 
 function getCollectionNameFromDoc(doc: any): string | undefined {
