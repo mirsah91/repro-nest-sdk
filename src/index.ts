@@ -502,6 +502,74 @@ function alignedNow(): number {
     return alignTimestamp(Date.now());
 }
 
+function balanceTraceEvents(events: Array<{
+    t: number;
+    type: 'enter' | 'exit';
+    functionType?: string | null;
+    fn?: string;
+    file?: string;
+    line?: number | null;
+    depth?: number;
+    args?: any;
+    returnValue?: any;
+    threw?: boolean;
+    error?: any;
+    unawaited?: boolean;
+}>): typeof events {
+    if (!Array.isArray(events) || events.length === 0) return events;
+
+    const openByKey = new Map<string, Array<typeof events[number]>>();
+    let lastT = events[events.length - 1]?.t ?? Date.now();
+
+    const makeKey = (ev: typeof events[number]) => {
+        return [ev.fn || '', ev.file || '', String(ev.line ?? ''), ev.functionType || ''].join('|');
+    };
+
+    for (const ev of events) {
+        if (!ev || (ev.type !== 'enter' && ev.type !== 'exit')) continue;
+        if (typeof ev.t === 'number' && ev.t > lastT) lastT = ev.t;
+
+        const key = makeKey(ev);
+        if (!key) continue;
+
+        if (ev.type === 'enter') {
+            let stack = openByKey.get(key);
+            if (!stack) {
+                stack = [];
+                openByKey.set(key, stack);
+            }
+            stack.push(ev);
+        } else if (ev.type === 'exit') {
+            const stack = openByKey.get(key);
+            if (stack && stack.length) stack.pop();
+        }
+    }
+
+    for (const [, stack] of openByKey.entries()) {
+        if (!stack || !stack.length) continue;
+        while (stack.length) {
+            const enterEv = stack.pop()!;
+            lastT += 1;
+            events.push({
+                t: lastT,
+                type: 'exit',
+                fn: enterEv.fn,
+                file: enterEv.file,
+                line: enterEv.line,
+                functionType: enterEv.functionType,
+                depth: typeof enterEv.depth === 'number' ? Math.max(0, enterEv.depth - 1) : enterEv.depth,
+                args: enterEv.args,
+                returnValue: undefined,
+                threw: false,
+                error: undefined,
+                unawaited: true,
+            });
+        }
+    }
+
+    return events;
+}
+
 function getCollectionNameFromDoc(doc: any): string | undefined {
     const direct =
         doc?.$__?.collection?.collectionName ||
@@ -951,7 +1019,8 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
-                const traceBatches = chunkArray(events, TRACE_BATCH_SIZE);
+                const balancedEvents = balanceTraceEvents(events);
+                const traceBatches = chunkArray(balancedEvents, TRACE_BATCH_SIZE);
                 const requestBody = sanitizeRequestSnapshot((req as any).body);
                 const requestParams = sanitizeRequestSnapshot((req as any).params);
                 const requestQuery = sanitizeRequestSnapshot((req as any).query);
