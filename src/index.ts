@@ -103,6 +103,21 @@ export type TraceEventForFilter = {
     library?: string | null;
 };
 
+type TraceEventRecord = {
+    t: number;
+    type: 'enter' | 'exit';
+    functionType?: string | null;
+    fn?: string;
+    file?: string;
+    line?: number | null;
+    depth?: number;
+    args?: any;
+    returnValue?: any;
+    threw?: boolean;
+    error?: any;
+    unawaited?: boolean;
+};
+
 type EndpointTraceInfo = {
     fn: string | null;
     file: string | null;
@@ -325,6 +340,31 @@ export function enableReproTraceLogs() { setReproTraceLogsEnabled(true); }
 
 export function disableReproTraceLogs() { setReproTraceLogsEnabled(false); }
 
+function summarizeEndpointFromEvents(events: TraceEventRecord[]) {
+    let endpointTrace: EndpointTraceInfo | null = null;
+    let preferredAppTrace: EndpointTraceInfo | null = null;
+    let firstAppTrace: EndpointTraceInfo | null = null;
+
+    for (const evt of events) {
+        if (evt.type !== 'enter') continue;
+        if (!isLikelyAppFile(evt.file)) continue;
+        const depthOk = evt.depth === undefined || evt.depth <= 6;
+        const trace = toEndpointTrace(evt);
+
+        if (!firstAppTrace && depthOk) {
+            firstAppTrace = trace;
+        }
+
+        if (isLikelyNestControllerFile(evt.file)) {
+            endpointTrace = trace;
+        } else if (depthOk && !preferredAppTrace && !isLikelyNestGuardFile(evt.file)) {
+            preferredAppTrace = trace;
+        }
+    }
+
+    return { endpointTrace, preferredAppTrace, firstAppTrace };
+}
+
 // (function ensureTracerAutoInit() {
 //     if (__TRACER_READY) return;
 //
@@ -502,6 +542,59 @@ function alignedNow(): number {
     return alignTimestamp(Date.now());
 }
 
+function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
+    if (!Array.isArray(events) || events.length === 0) return events;
+
+    const makeKey = (ev: TraceEventRecord) =>
+        [ev.fn || '', ev.file || '', String(ev.line ?? ''), ev.functionType || ''].join('|');
+
+    const seenKeys = new Set<string>();
+    const balanced: TraceEventRecord[] = [];
+
+    for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (!ev || (ev.type !== 'enter' && ev.type !== 'exit')) {
+            balanced.push(ev);
+            continue;
+        }
+
+        balanced.push(ev);
+        if (ev.type !== 'enter') continue;
+
+        const key = makeKey(ev);
+        if (!key || seenKeys.has(key)) continue;
+
+        let hasExit = false;
+        for (let j = i + 1; j < events.length; j++) {
+            const later = events[j];
+            if (later && later.type === 'exit' && makeKey(later) === key) {
+                hasExit = true;
+                break;
+            }
+        }
+
+        if (!hasExit) {
+            seenKeys.add(key);
+            balanced.push({
+                t: ev.t,
+                type: 'exit',
+                fn: ev.fn,
+                file: ev.file,
+                line: ev.line,
+                functionType: ev.functionType,
+                depth: typeof ev.depth === 'number' ? Math.max(0, ev.depth - 1) : ev.depth,
+                args: ev.args,
+                returnValue: undefined,
+                threw: false,
+                error: undefined,
+                unawaited: true,
+            });
+        }
+    }
+
+    return balanced;
+}
+
 function getCollectionNameFromDoc(doc: any): string | undefined {
     const direct =
         doc?.$__?.collection?.collectionName ||
@@ -662,6 +755,7 @@ const TRACE_VALUE_MAX_KEYS = 20;
 const TRACE_VALUE_MAX_ITEMS = 20;
 const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
+const TRACE_FLUSH_DELAY_MS = 20;
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
     if (!Array.isArray(arr) || arr.length === 0) return [];
@@ -840,21 +934,16 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
         (res as any).end = (chunk?: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origEnd(chunk, ...args); };
 
         // ---- our ALS (unchanged) ----
-        als.run({ sid, aid, clockSkewMs }, () => {
-            // subscribe to tracer for this request (passive only)
-            const events: Array<{
-                t: number;
-                type: 'enter' | 'exit';
-                functionType?: string | null;
-                fn?: string;
-                file?: string;
-                line?: number | null;
-                depth?: number;
-                args?: any;
-                returnValue?: any;
-                threw?: boolean;
-                error?: any;
-            }> = [];
+        const tracerApiWithTrace = __TRACER__ as (TracerApi & { withTrace?: (id: string, fn: () => void) => void }) | null;
+        const runInTrace = (fn: () => void) => {
+            if (tracerApiWithTrace?.withTrace) {
+                return tracerApiWithTrace.withTrace(rid, fn);
+            }
+            return fn();
+        };
+
+        runInTrace(() => als.run({ sid, aid, clockSkewMs }, () => {
+            const events: TraceEventRecord[] = [];
             let endpointTrace: EndpointTraceInfo | null = null;
             let preferredAppTrace: EndpointTraceInfo | null = null;
             let firstAppTrace: EndpointTraceInfo | null = null;
@@ -864,67 +953,69 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                 if (__TRACER__?.tracer?.on) {
                     const getTid = __TRACER__?.getCurrentTraceId;
                     const tidNow = getTid ? getTid() : null;
-
                     if (tidNow) {
                         unsubscribe = __TRACER__.tracer.on((ev: any) => {
-                            if (ev && ev.traceId === tidNow) {
-                                const evt: typeof events[number] = {
-                                    t: alignTimestamp(ev.t),
-                                    type: ev.type,
-                                    fn: ev.fn,
-                                    file: ev.file,
-                                    line: ev.line,
-                                    depth: ev.depth,
-                                };
+                            if (!ev || ev.traceId !== tidNow) return;
 
-                                if (ev.functionType !== undefined) {
-                                    evt.functionType = ev.functionType;
-                                }
+                            const evt: TraceEventRecord = {
+                                t: alignTimestamp(ev.t),
+                                type: ev.type,
+                                fn: ev.fn,
+                                file: ev.file,
+                                line: ev.line,
+                                depth: ev.depth,
+                            };
 
-                                if (ev.args !== undefined) {
-                                    evt.args = sanitizeTraceArgs(ev.args);
-                                }
-                                if (ev.returnValue !== undefined) {
-                                    evt.returnValue = sanitizeTraceValue(ev.returnValue);
-                                }
-                                if (ev.error !== undefined) {
-                                    evt.error = sanitizeTraceValue(ev.error);
-                                }
-                                if (ev.threw !== undefined) {
-                                    evt.threw = Boolean(ev.threw);
-                                }
-
-                                const candidate: TraceEventForFilter = {
-                                    type: evt.type,
-                                    eventType: evt.type,
-                                    functionType: ev.functionType ?? null,
-                                    fn: evt.fn,
-                                    file: evt.file ?? null,
-                                    depth: evt.depth,
-                                    library: inferLibraryNameFromFile(evt.file),
-                                };
-
-                                if (shouldDropTraceEvent(candidate)) {
-                                    return;
-                                }
-
-                                if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
-                                    const depthOk = evt.depth === undefined || evt.depth <= 6;
-                                    const trace = toEndpointTrace(evt);
-
-                                    if (depthOk && !firstAppTrace) {
-                                        firstAppTrace = trace;
-                                    }
-
-                                    if (isLikelyNestControllerFile(evt.file)) {
-                                        endpointTrace = trace;
-                                    } else if (depthOk && !preferredAppTrace && !isLikelyNestGuardFile(evt.file)) {
-                                        preferredAppTrace = trace;
-                                    }
-                                }
-
-                                events.push(evt);
+                            if (ev.functionType !== undefined) {
+                                evt.functionType = ev.functionType;
                             }
+
+                            if (ev.args !== undefined) {
+                                evt.args = sanitizeTraceArgs(ev.args);
+                            }
+                            if (ev.returnValue !== undefined) {
+                                evt.returnValue = sanitizeTraceValue(ev.returnValue);
+                            }
+                            if (ev.error !== undefined) {
+                                evt.error = sanitizeTraceValue(ev.error);
+                            }
+                            if (ev.threw !== undefined) {
+                                evt.threw = Boolean(ev.threw);
+                            }
+                            if (ev.unawaited !== undefined) {
+                                evt.unawaited = ev.unawaited === true;
+                            }
+
+                            const candidate: TraceEventForFilter = {
+                                type: evt.type,
+                                eventType: evt.type,
+                                functionType: evt.functionType ?? null,
+                                fn: evt.fn,
+                                file: evt.file ?? null,
+                                depth: evt.depth,
+                                library: inferLibraryNameFromFile(evt.file),
+                            };
+
+                            if (shouldDropTraceEvent(candidate)) {
+                                return;
+                            }
+
+                            if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
+                                const depthOk = evt.depth === undefined || evt.depth <= 6;
+                                const trace = toEndpointTrace(evt);
+
+                                if (depthOk && !firstAppTrace) {
+                                    firstAppTrace = trace;
+                                }
+
+                                if (isLikelyNestControllerFile(evt.file)) {
+                                    endpointTrace = trace;
+                                } else if (depthOk && !preferredAppTrace && !isLikelyNestGuardFile(evt.file)) {
+                                    preferredAppTrace = trace;
+                                }
+                            }
+
+                            events.push(evt);
                         });
                     }
                 }
@@ -938,72 +1029,82 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
-                const traceBatches = chunkArray(events, TRACE_BATCH_SIZE);
-                const requestBody = sanitizeRequestSnapshot((req as any).body);
-                const requestParams = sanitizeRequestSnapshot((req as any).params);
-                const requestQuery = sanitizeRequestSnapshot((req as any).query);
+                const flushPayload = () => {
+                    const balancedEvents = balanceTraceEvents(events.slice());
+                    const summary = summarizeEndpointFromEvents(balancedEvents);
+                    const chosenEndpoint = summary.endpointTrace
+                        ?? summary.preferredAppTrace
+                        ?? summary.firstAppTrace
+                        ?? endpointTrace
+                        ?? preferredAppTrace
+                        ?? firstAppTrace
+                        ?? { fn: null, file: null, line: null, functionType: null };
+                    const traceBatches = chunkArray(balancedEvents, TRACE_BATCH_SIZE);
+                    const requestBody = sanitizeRequestSnapshot((req as any).body);
+                    const requestParams = sanitizeRequestSnapshot((req as any).params);
+                    const requestQuery = sanitizeRequestSnapshot((req as any).query);
 
-                const requestPayload: Record<string, any> = {
-                    rid,
-                    method: req.method,
-                    url,
-                    path,
-                    status: res.statusCode,
-                    durMs: Date.now() - t0,
-                    headers: {},
-                    key,
-                    respBody: capturedBody,
-                    trace: traceBatches.length ? undefined : '[]',
-                };
-                if (requestBody !== undefined) requestPayload.body = requestBody;
-                if (requestParams !== undefined) requestPayload.params = requestParams;
-                if (requestQuery !== undefined) requestPayload.query = requestQuery;
-                const entryPointPayload = endpointTrace
-                    ?? preferredAppTrace
-                    ?? firstAppTrace
-                    ?? { fn: null, file: null, line: null, functionType: null };
-                requestPayload.entryPoint = entryPointPayload;
+                    const requestPayload: Record<string, any> = {
+                        rid,
+                        method: req.method,
+                        url,
+                        path,
+                        status: res.statusCode,
+                        durMs: Date.now() - t0,
+                        headers: {},
+                        key,
+                        respBody: capturedBody,
+                        trace: traceBatches.length ? undefined : '[]',
+                    };
+                    if (requestBody !== undefined) requestPayload.body = requestBody;
+                    if (requestParams !== undefined) requestPayload.params = requestParams;
+                    if (requestQuery !== undefined) requestPayload.query = requestQuery;
+                    requestPayload.entryPoint = chosenEndpoint;
 
-                post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-                    entries: [{
-                        actionId: aid,
-                        request: requestPayload,
-                        t: alignedNow(),
-                    }]
-                });
-                console.log('traceBatches --->', traceBatches)
+                    post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
+                        entries: [{
+                            actionId: aid,
+                            request: requestPayload,
+                            t: alignedNow(),
+                        }]
+                    });
 
+                    if (traceBatches.length) {
+                        for (let i = 0; i < traceBatches.length; i++) {
+                            const batch = traceBatches[i];
+                            let traceStr = '[]';
+                            try { traceStr = JSON.stringify(batch); } catch {}
 
-                if (traceBatches.length) {
-                    console.log('inside traceBatches.length --->')
-
-                    for (let i = 0; i < traceBatches.length; i++) {
-                        const batch = traceBatches[i];
-                        let traceStr = '[]';
-                        try { traceStr = JSON.stringify(batch); } catch {}
-
-                        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-                            entries: [{
-                                actionId: aid,
-                                trace: traceStr,
-                                traceBatch: {
-                                    rid,
-                                    index: i,
-                                    total: traceBatches.length,
-                                },
-                                t: alignedNow(),
-                            }],
-                        });
-                        console.log('inside post --->')
-
+                            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
+                                entries: [{
+                                    actionId: aid,
+                                    trace: traceStr,
+                                    traceBatch: {
+                                        rid,
+                                        index: i,
+                                        total: traceBatches.length,
+                                    },
+                                    t: alignedNow(),
+                                }],
+                            });
+                        }
                     }
-                }
+                };
 
-                try { unsubscribe && unsubscribe(); } catch {}
+                const scheduleFlush = () => {
+                    try { unsubscribe && unsubscribe(); } catch {}
+                    flushPayload();
+                };
+
+                if (__TRACER_READY) {
+                    setTimeout(scheduleFlush, TRACE_FLUSH_DELAY_MS);
+                } else {
+                    scheduleFlush();
+                }
             });
 
             next();
-        });
+        }));
     };
 }
 

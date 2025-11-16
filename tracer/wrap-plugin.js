@@ -256,6 +256,63 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             n.__wrapped = true;
         }
 
+        function isSkippableParent(p) {
+            if (!p) return false;
+            if (p.isParenthesizedExpression && p.isParenthesizedExpression()) return true;
+            if (p.isTSAsExpression && p.isTSAsExpression()) return true;
+            if (p.isTSTypeAssertion && p.isTSTypeAssertion()) return true;
+            if (p.isTSNonNullExpression && p.isTSNonNullExpression()) return true;
+            if (p.isTypeCastExpression && p.isTypeCastExpression()) return true;
+            if (p.isSequenceExpression && p.isSequenceExpression()) return true;
+            if (p.isConditionalExpression && p.isConditionalExpression()) return true;
+            if (p.isLogicalExpression && p.isLogicalExpression()) return true;
+            if (p.isBinaryExpression && p.isBinaryExpression()) return true;
+            if (p.isUnaryExpression && p.isUnaryExpression()) return true;
+            if (p.isArrayExpression && p.isArrayExpression()) return true;
+            if (p.isObjectExpression && p.isObjectExpression()) return true;
+            if (p.isObjectProperty && p.isObjectProperty()) return true;
+            if (p.isObjectMethod && p.isObjectMethod()) return true;
+            if (p.isSpreadElement && p.isSpreadElement()) return true;
+            if (p.isCallExpression && p.isCallExpression()) return true;
+            if (p.isNewExpression && p.isNewExpression()) return true;
+            if (p.isMemberExpression && p.isMemberExpression()) return true;
+            if (p.isOptionalMemberExpression && p.isOptionalMemberExpression()) return true;
+            if (p.isTaggedTemplateExpression && p.isTaggedTemplateExpression()) return true;
+            if (p.isTemplateLiteral && p.isTemplateLiteral()) return true;
+            return false;
+        }
+
+        function isAwaitedCall(path) {
+            let current = path;
+            const funcParent = path.getFunctionParent();
+
+            while (current && current.parentPath) {
+                const parent = current.parentPath;
+
+                if (parent.isAwaitExpression && parent.isAwaitExpression()) return true;
+                if (parent.isYieldExpression && parent.isYieldExpression()) return true;
+
+                if (parent.isReturnStatement && parent.isReturnStatement()) {
+                    if (parent.node.argument === current.node &&
+                        funcParent &&
+                        (funcParent.node.async || funcParent.node.generator)) {
+                        return true;
+                    }
+                }
+
+                if (parent.isForOfStatement && parent.isForOfStatement()) {
+                    if (parent.node.await === true && parent.node.right === current.node) {
+                        return true;
+                    }
+                }
+
+                if (!isSkippableParent(parent)) break;
+                current = parent;
+            }
+
+            return false;
+        }
+
         // ---- NEW: wrap every call-site with __repro_call(...) ----
         function wrapCall(path, state) {
             const { node: n } = path;
@@ -284,6 +341,8 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const fileLit = t.stringLiteral(file ?? '');
             const lineLit = t.numericLiteral(line ?? 0);
 
+            const unawaited = !isAwaitedCall(path);
+
             // Default: no thisArg, label from identifier name if any
             let label = '';
             let callExpr;
@@ -306,7 +365,15 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
                 const reproCall = t.callExpression(
                     t.identifier('__repro_call'),
-                    [ fnId, objId, argsArray, fileLit, lineLit, t.stringLiteral(label || '') ]
+                    [
+                        fnId,
+                        objId,
+                        argsArray,
+                        fileLit,
+                        lineLit,
+                        t.stringLiteral(label || ''),
+                        t.booleanLiteral(unawaited)
+                    ]
                 );
 
                 // Build a single expression that:
@@ -332,7 +399,15 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
                 const reproCall = t.callExpression(
                     t.identifier('__repro_call'),
-                    [ fnId, t.nullLiteral(), argsArray, fileLit, lineLit, t.stringLiteral(label || '') ]
+                    [
+                        fnId,
+                        t.nullLiteral(),
+                        argsArray,
+                        fileLit,
+                        lineLit,
+                        t.stringLiteral(label || ''),
+                        t.booleanLiteral(unawaited)
+                    ]
                 );
 
                 callExpr = t.sequenceExpression([

@@ -1,6 +1,6 @@
 {
   "name": "repro-nest",
-  "version": "0.0.54",
+  "version": "0.0.89",
   "description": "Repro Nest SDK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -23,15 +23,24 @@
     "access": "public"
   },
   "dependencies": {
+    "@babel/core": "^7.28.4",
     "@babel/generator": "^7.28.3",
     "@babel/parser": "^7.28.4",
+    "@babel/plugin-transform-typescript": "^7.28.0",
     "@babel/traverse": "^7.28.4",
     "@babel/types": "^7.28.4",
-    "pirates": "^4.0.7",
-    "@babel/core": "^7.28.4",
-    "@babel/plugin-transform-typescript": "^7.28.0",
+    "@jridgewell/trace-mapping": "^0.3.25",
+    "@nestjs/common": "^11.1.9",
+    "@nestjs/core": "^11.1.9",
+    "@nestjs/platform-express": "^11.1.9",
     "express": "^5.1.0",
-    "mongoose": "^8.18.2",
-    "@jridgewell/trace-mapping": "^0.3.25"
+    "import-in-the-middle": "^2.0.0",
+    "mongoose": ">=6",
+    "pirates": "^4.0.7",
+    "reflect-metadata": "^0.2.2",
+    "require-in-the-middle": "^8.0.1",
+    "rxjs": "^7.8.2",
+    "shimmer": "^1.2.1",
+    "testcontainers": "^11.8.1"
   }
 }

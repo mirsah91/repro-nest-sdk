@@ -34,7 +34,7 @@ function wrapFunction(original, label, file, line) {
     const wrapped = function reproWrapped() {
         // Use the call-site shim to classify app/dep and to safely handle thenables
         return global.__repro_call
-            ? global.__repro_call(original, this, Array.from(arguments), file, line, label || original.name || '')
+            ? global.__repro_call(original, this, Array.from(arguments), file, line, label || original.name || '', false)
             : original.apply(this, arguments);
     };
 
