@@ -871,74 +871,75 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
 
             try {
                 if (__TRACER__?.tracer?.on) {
-                    const getTid = __TRACER__?.getCurrentTraceId;
-                    const tidNow = getTid ? getTid() : null;
+                    unsubscribe = __TRACER__.tracer.on((ev: any) => {
+                        if (!ev) return;
 
-                    if (tidNow) {
-                        unsubscribe = __TRACER__.tracer.on((ev: any) => {
-                            if (ev && ev.traceId === tidNow) {
-                                const evt: typeof events[number] = {
-                                    t: alignTimestamp(ev.t),
-                                    type: ev.type,
-                                    fn: ev.fn,
-                                    file: ev.file,
-                                    line: ev.line,
-                                    depth: ev.depth,
-                                };
+                        // Associate events to this HTTP request using our ALS context
+                        const ctxNow = getCtx();
+                        if (!ctxNow || ctxNow.sid !== sid || ctxNow.aid !== aid) {
+                            return;
+                        }
 
-                                if (ev.functionType !== undefined) {
-                                    evt.functionType = ev.functionType;
-                                }
+                        const evt: typeof events[number] = {
+                            t: alignTimestamp(ev.t),
+                            type: ev.type,
+                            fn: ev.fn,
+                            file: ev.file,
+                            line: ev.line,
+                            depth: ev.depth,
+                        };
 
-                                if (ev.args !== undefined) {
-                                    evt.args = sanitizeTraceArgs(ev.args);
-                                }
-                                if (ev.returnValue !== undefined) {
-                                    evt.returnValue = sanitizeTraceValue(ev.returnValue);
-                                }
-                                if (ev.error !== undefined) {
-                                    evt.error = sanitizeTraceValue(ev.error);
-                                }
-                                if (ev.threw !== undefined) {
-                                    evt.threw = Boolean(ev.threw);
-                                }
-                                if (ev.unawaited !== undefined) {
-                                    evt.unawaited = ev.unawaited === true;
-                                }
+                        if (ev.functionType !== undefined) {
+                            evt.functionType = ev.functionType;
+                        }
 
-                                const candidate: TraceEventForFilter = {
-                                    type: evt.type,
-                                    eventType: evt.type,
-                                    functionType: ev.functionType ?? null,
-                                    fn: evt.fn,
-                                    file: evt.file ?? null,
-                                    depth: evt.depth,
-                                    library: inferLibraryNameFromFile(evt.file),
-                                };
+                        if (ev.args !== undefined) {
+                            evt.args = sanitizeTraceArgs(ev.args);
+                        }
+                        if (ev.returnValue !== undefined) {
+                            evt.returnValue = sanitizeTraceValue(ev.returnValue);
+                        }
+                        if (ev.error !== undefined) {
+                            evt.error = sanitizeTraceValue(ev.error);
+                        }
+                        if (ev.threw !== undefined) {
+                            evt.threw = Boolean(ev.threw);
+                        }
+                        if (ev.unawaited !== undefined) {
+                            evt.unawaited = ev.unawaited === true;
+                        }
 
-                                if (shouldDropTraceEvent(candidate)) {
-                                    return;
-                                }
+                        const candidate: TraceEventForFilter = {
+                            type: evt.type,
+                            eventType: evt.type,
+                            functionType: ev.functionType ?? null,
+                            fn: evt.fn,
+                            file: evt.file ?? null,
+                            depth: evt.depth,
+                            library: inferLibraryNameFromFile(evt.file),
+                        };
 
-                                if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
-                                    const depthOk = evt.depth === undefined || evt.depth <= 6;
-                                    const trace = toEndpointTrace(evt);
+                        if (shouldDropTraceEvent(candidate)) {
+                            return;
+                        }
 
-                                    if (depthOk && !firstAppTrace) {
-                                        firstAppTrace = trace;
-                                    }
+                        if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
+                            const depthOk = evt.depth === undefined || evt.depth <= 6;
+                            const trace = toEndpointTrace(evt);
 
-                                    if (isLikelyNestControllerFile(evt.file)) {
-                                        endpointTrace = trace;
-                                    } else if (depthOk && !preferredAppTrace && !isLikelyNestGuardFile(evt.file)) {
-                                        preferredAppTrace = trace;
-                                    }
-                                }
-
-                                events.push(evt);
+                            if (depthOk && !firstAppTrace) {
+                                firstAppTrace = trace;
                             }
-                        });
-                    }
+
+                            if (isLikelyNestControllerFile(evt.file)) {
+                                endpointTrace = trace;
+                            } else if (depthOk && !preferredAppTrace && !isLikelyNestGuardFile(evt.file)) {
+                                preferredAppTrace = trace;
+                            }
+                        }
+
+                        events.push(evt);
+                    });
                 }
             } catch { /* never break user code */ }
 
