@@ -5,6 +5,7 @@ const als = new AsyncLocalStorage(); // { traceId, depth }
 const listeners = new Set();
 let EMITTING = false;
 const quietEnv = process.env.TRACE_QUIET === '1';
+const DEBUG_UNAWAITED = process.env.TRACE_DEBUG_UNAWAITED !== '0';
 let functionLogsEnabled = !quietEnv;
 
 // ---- console patch: trace console.* as top-level calls (safe; no recursion) ----
@@ -53,6 +54,9 @@ const trace = {
         if (Array.isArray(pendingQueue) && pendingQueue.length) {
             const marker = pendingQueue.shift();
             frameUnawaited = !!(marker && marker.unawaited);
+        }
+        if (DEBUG_UNAWAITED) {
+            try { process.stderr.write(`[unawaited] enter ${fn} -> ${frameUnawaited}\n`); } catch {}
         }
         frameStack.push(frameUnawaited);
 
@@ -158,6 +162,9 @@ const trace = {
             }
         }
 
+        if (DEBUG_UNAWAITED) {
+            try { process.stderr.write(`[unawaited] exit ${baseMeta.fn} -> ${forceUnawaited}\n`); } catch {}
+        }
         emitExit({ unawaited: forceUnawaited });
     }
 };
