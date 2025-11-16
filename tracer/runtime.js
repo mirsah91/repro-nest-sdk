@@ -46,6 +46,16 @@ const trace = {
     enter(fn, meta, detail){
         const ctx = als.getStore() || {};
         ctx.depth = (ctx.depth || 0) + 1;
+
+        const frameStack = ctx.__repro_frame_unawaited || (ctx.__repro_frame_unawaited = []);
+        const pendingQueue = ctx.__repro_pending_unawaited;
+        let frameUnawaited = false;
+        if (Array.isArray(pendingQueue) && pendingQueue.length) {
+            const marker = pendingQueue.shift();
+            frameUnawaited = !!(marker && marker.unawaited);
+        }
+        frameStack.push(frameUnawaited);
+
         emit({
             type: 'enter',
             t: Date.now(),
@@ -67,12 +77,16 @@ const trace = {
             line: meta?.line,
             functionType: meta?.functionType || null
         };
+        const frameStack = ctx.__repro_frame_unawaited;
+        const frameUnawaited = Array.isArray(frameStack) && frameStack.length
+            ? !!frameStack.pop()
+            : false;
         const baseDetail = {
             args: detail?.args,
             returnValue: detail?.returnValue,
             error: detail?.error,
             threw: detail?.threw === true,
-            unawaited: detail?.unawaited === true
+            unawaited: detail?.unawaited === true || frameUnawaited
         };
 
         const promiseTaggedUnawaited = !!(baseDetail.returnValue && baseDetail.returnValue[SYM_UNAWAITED]);
@@ -309,9 +323,28 @@ if (!global.__repro_call) {
 
                 const isApp = fn[SYM_IS_APP] === true;
                 if (isApp) {
-                    const out = fn.apply(thisArg, args);
-                    if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
-                    return out;
+                    const ctx = als.getStore();
+                    let pendingMarker = null;
+                    if (ctx && isUnawaitedCall) {
+                        const queue = ctx.__repro_pending_unawaited || (ctx.__repro_pending_unawaited = []);
+                        pendingMarker = { unawaited: true, id: Symbol('unawaited') };
+                        queue.push(pendingMarker);
+                    }
+
+                    try {
+                        const out = fn.apply(thisArg, args);
+                        if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
+                        return out;
+                    } finally {
+                        if (pendingMarker) {
+                            const store = als.getStore();
+                            const queue = store && store.__repro_pending_unawaited;
+                            if (Array.isArray(queue)) {
+                                const idx = queue.indexOf(pendingMarker);
+                                if (idx !== -1) queue.splice(idx, 1);
+                            }
+                        }
+                    }
                 }
 
                 const name = (label && label.length) || fn.name
