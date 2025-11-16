@@ -840,7 +840,15 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
         (res as any).end = (chunk?: any, ...args: any[]) => { try { if (chunk != null) chunks.push(chunk); } catch {} return origEnd(chunk, ...args); };
 
         // ---- our ALS (unchanged) ----
-        als.run({ sid, aid, clockSkewMs }, () => {
+        const tracerApi = __TRACER__ || null;
+        const runInTrace = (fn: () => void) => {
+            if (tracerApi?.withTrace) {
+                return tracerApi.withTrace(rid, fn);
+            }
+            return fn();
+        };
+
+        runInTrace(() => als.run({ sid, aid, clockSkewMs }, () => {
             // subscribe to tracer for this request (passive only)
             const events: Array<{
                 t: number;
@@ -1007,7 +1015,7 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
             });
 
             next();
-        });
+        }));
     };
 }
 
