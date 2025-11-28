@@ -116,6 +116,7 @@ type TraceEventRecord = {
     threw?: boolean;
     error?: any;
     unawaited?: boolean;
+    late?: boolean;
 };
 
 type EndpointTraceInfo = {
@@ -1204,6 +1205,9 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             }
                             if (ev.unawaited !== undefined) {
                                 evt.unawaited = ev.unawaited === true;
+                            }
+                            if (ev.late !== undefined) {
+                                evt.late = ev.late === true;
                             }
 
                             const candidate: TraceEventForFilter = {
