@@ -125,6 +125,23 @@ type EndpointTraceInfo = {
     functionType: string | null;
 };
 
+export type HeaderRule = string | RegExp;
+export type HeaderCaptureOptions = {
+    /** When true, sensitive headers such as Authorization are kept; default redacts them. */
+    allowSensitiveHeaders?: boolean;
+    /** Additional header names (string or RegExp) to drop from captures. */
+    dropHeaders?: HeaderRule | HeaderRule[];
+    /** Explicit allowlist that overrides defaults and drop rules. */
+    keepHeaders?: HeaderRule | HeaderRule[];
+};
+
+type NormalizedHeaderCapture = {
+    enabled: boolean;
+    allowSensitive: boolean;
+    drop: HeaderRule[];
+    keep: HeaderRule[];
+};
+
 /** Lightweight helper to disable every trace emitted from specific files. */
 export interface DisableTraceByFilename {
     file: TraceRulePattern;
@@ -757,6 +774,96 @@ const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
 const TRACE_FLUSH_DELAY_MS = 20;
 
+function isThenable(value: any): value is PromiseLike<any> {
+    return value != null && typeof value === 'object' && typeof (value as any).then === 'function';
+}
+
+function coerceMongoId(value: any): string | null {
+    if (!value) return null;
+    const name = value?.constructor?.name;
+    if (name === 'ObjectId' || name === 'ObjectID' || value?._bsontype === 'ObjectID') {
+        try {
+            if (typeof (value as any).toHexString === 'function') return (value as any).toHexString();
+            if (typeof (value as any).toString === 'function') return (value as any).toString();
+        } catch {}
+        return '[mongo-id]';
+    }
+    return null;
+}
+
+function isMongoSessionLike(value: any): boolean {
+    const ctor = value?.constructor?.name?.toLowerCase?.() || '';
+    return (
+        !!ctor &&
+        ctor.includes('session') &&
+        (typeof (value as any).endSession === 'function' || typeof (value as any).inTransaction === 'function')
+    );
+}
+
+function describeMongoPlaceholder(value: any): string | null {
+    const ctor = value?.constructor?.name;
+    if (!ctor) return null;
+    const lower = ctor.toLowerCase();
+
+    if (isMongoSessionLike(value)) return 'mongo-session';
+    if (lower.includes('cursor')) return 'mongo-cursor';
+    if (lower.includes('topology')) return 'mongo-topology';
+    if (lower.includes('connection')) return 'mongo-connection';
+    if (lower.includes('collection')) {
+        const name = (value as any)?.collectionName || (value as any)?.name;
+        return name ? `mongo-collection(${name})` : 'mongo-collection';
+    }
+    if (lower.includes('db') && typeof (value as any).command === 'function') return 'mongo-db';
+    return null;
+}
+
+function isMongooseDocumentLike(value: any): boolean {
+    return !!value && typeof value === 'object' && typeof (value as any).toObject === 'function' && !!(value as any).$__;
+}
+
+function toPlainMongooseDoc(value: any): any | null {
+    try {
+        const plain = (value as any).toObject?.({ depopulate: true, virtuals: false, minimize: false, getters: false });
+        if (plain && plain !== value) return plain;
+    } catch {}
+    try {
+        const json = (value as any).toJSON?.();
+        if (json && json !== value) return json;
+    } catch {}
+    return null;
+}
+
+function isMongooseQueryLike(value: any): boolean {
+    return !!value && typeof value === 'object' && typeof (value as any).exec === 'function' && ((value as any).model || (value as any).op);
+}
+
+function summarizeMongooseQueryValue(value: any, depth: number, seen: WeakSet<object>) {
+    try {
+        const model = (value as any).model?.modelName || (value as any)._model?.modelName || undefined;
+        const op = (value as any).op || (value as any).operation || (value as any).options?.op || undefined;
+        return {
+            __type: 'MongooseQuery',
+            model,
+            op,
+            filter: sanitizeTraceValue((value as any).getFilter?.() ?? (value as any)._conditions, depth + 1, seen),
+            update: sanitizeTraceValue((value as any).getUpdate?.() ?? (value as any)._update, depth + 1, seen),
+            options: sanitizeTraceValue((value as any).getOptions?.() ?? (value as any).options, depth + 1, seen),
+        };
+    } catch {
+        return 'mongo-query';
+    }
+}
+
+function safeStringifyUnknown(value: any): string | undefined {
+    try {
+        const str = String(value);
+        if (str === '[object Object]') return '[unserializable]';
+        return str;
+    } catch {
+        return undefined;
+    }
+}
+
 function chunkArray<T>(arr: T[], size: number): T[][] {
     if (!Array.isArray(arr) || arr.length === 0) return [];
     if (!size || size <= 0) return [arr.slice()];
@@ -780,6 +887,27 @@ function sanitizeTraceValue(value: any, depth = 0, seen: WeakSet<object> = new W
     if (type === 'bigint') return value.toString();
     if (type === 'symbol') return value.toString();
     if (type === 'function') return `[Function${value.name ? ` ${value.name}` : ''}]`;
+
+    const mongoId = coerceMongoId(value);
+    if (mongoId !== null) return mongoId;
+
+    if (isMongooseQueryLike(value)) {
+        return summarizeMongooseQueryValue(value, depth, seen);
+    }
+
+    const mongoPlaceholder = describeMongoPlaceholder(value);
+    if (mongoPlaceholder) return mongoPlaceholder;
+
+    if (isThenable(value)) {
+        return { __type: 'Promise', state: 'pending' };
+    }
+
+    if (isMongooseDocumentLike(value)) {
+        const plain = toPlainMongooseDoc(value);
+        if (plain && plain !== value) {
+            return sanitizeTraceValue(plain, depth, seen);
+        }
+    }
 
     if (Buffer.isBuffer(value)) {
         return {
@@ -892,14 +1020,105 @@ function sanitizeRequestSnapshot(value: any) {
             return value;
         }
         try { return JSON.parse(JSON.stringify(value)); } catch {}
-        try { return String(value); } catch { return undefined; }
+        return safeStringifyUnknown(value);
     }
+}
+
+const DEFAULT_SENSITIVE_HEADERS: Array<string | RegExp> = [
+    'authorization',
+    'proxy-authorization',
+    'authentication',
+    'auth',
+    'x-api-key',
+    'api-key',
+    'apikey',
+    'x-api-token',
+    'x-access-token',
+    'x-auth-token',
+    'x-id-token',
+    'x-refresh-token',
+    'id-token',
+    'refresh-token',
+    'cookie',
+    'set-cookie',
+];
+
+function normalizeHeaderRules(rules?: HeaderRule | HeaderRule[] | null): HeaderRule[] {
+    return normalizePatternArray<HeaderRule>(rules || []);
+}
+
+function matchesHeaderRule(name: string, rules: HeaderRule[]): boolean {
+    if (!rules || !rules.length) return false;
+    const lower = name.toLowerCase();
+    return rules.some(rule => {
+        if (rule instanceof RegExp) {
+            try { return rule.test(name); } catch { return false; }
+        }
+        return lower === String(rule).toLowerCase();
+    });
+}
+
+function normalizeHeaderCaptureConfig(raw?: boolean | HeaderCaptureOptions): NormalizedHeaderCapture {
+    if (raw === false) {
+        return { enabled: false, allowSensitive: false, drop: [], keep: [] };
+    }
+    const opts: HeaderCaptureOptions = raw && raw !== true ? raw : {};
+    return {
+        enabled: true,
+        allowSensitive: opts.allowSensitiveHeaders === true,
+        drop: normalizeHeaderRules(opts.dropHeaders),
+        keep: normalizeHeaderRules(opts.keepHeaders),
+    };
+}
+
+function sanitizeHeaderValue(value: any): any {
+    if (value === undefined) return undefined;
+    if (Array.isArray(value)) {
+        const arr = value.map(v => sanitizeHeaderValue(v)).filter(v => v !== undefined);
+        return arr.length ? arr : undefined;
+    }
+    if (value === null) return null;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+    const safe = safeJson(value);
+    if (safe !== undefined) return safe;
+    return safeStringifyUnknown(value);
+}
+
+function sanitizeHeaders(headers: any, rawCfg?: boolean | HeaderCaptureOptions) {
+    const cfg = normalizeHeaderCaptureConfig(rawCfg);
+    if (!cfg.enabled) return {};
+
+    const dropList = cfg.allowSensitive ? cfg.drop : [...DEFAULT_SENSITIVE_HEADERS, ...cfg.drop];
+    const out: Record<string, any> = {};
+
+    for (const [rawKey, rawVal] of Object.entries(headers || {})) {
+        const key = String(rawKey || '').toLowerCase();
+        if (!key) continue;
+        const shouldDrop = matchesHeaderRule(key, dropList);
+        const keep = matchesHeaderRule(key, cfg.keep);
+        if (shouldDrop && !keep) continue;
+
+        const sanitizedValue = sanitizeHeaderValue(rawVal);
+        if (sanitizedValue !== undefined) {
+            out[key] = sanitizedValue;
+        }
+    }
+    return out;
 }
 
 // ===================================================================
 // reproMiddleware — unchanged behavior + passive per-request trace
 // ===================================================================
-export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecret: string; apiBase: string }) {
+export type ReproMiddlewareConfig = {
+    appId: string;
+    tenantId: string;
+    appSecret: string;
+    apiBase: string;
+    /** Configure header capture/redaction. Defaults to capturing with sensitive headers removed. */
+    captureHeaders?: boolean | HeaderCaptureOptions;
+};
+
+export function reproMiddleware(cfg: ReproMiddlewareConfig) {
     return function (req: Request, res: Response, next: NextFunction) {
         const sid = (req.headers['x-bug-session-id'] as string) || '';
         const aid = (req.headers['x-bug-action-id'] as string) || '';
@@ -913,6 +1132,7 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
         const url = (req as any).originalUrl || req.url || '/';
         const path = url; // back-compat
         const key = normalizeRouteKey(req.method, url);
+        const requestHeaders = sanitizeHeaders(req.headers, cfg.captureHeaders);
 
         // ---- response body capture (unchanged) ----
         let capturedBody: any = undefined;
@@ -1051,7 +1271,7 @@ export function reproMiddleware(cfg: { appId: string; tenantId: string; appSecre
                         path,
                         status: res.statusCode,
                         durMs: Date.now() - t0,
-                        headers: {},
+                        headers: requestHeaders,
                         key,
                         respBody: capturedBody,
                         trace: traceBatches.length ? undefined : '[]',
@@ -1220,6 +1440,11 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
         });
 
         // -------- NON-intrusive generic query telemetry via schema hooks -------
+        const sanitizeDbValue = (value: any) => {
+            const sanitized = sanitizeTraceValue(value);
+            return sanitized === undefined ? undefined : sanitized;
+        };
+
         const READ_OPS = [
             'find',
             'findOne',
@@ -1233,7 +1458,14 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             'updateMany',
             'replaceOne',
             'deleteMany',
-            'findOneAndUpdate'
+            'findOneAndUpdate',
+            'findOneAndDelete',
+            'findOneAndRemove',
+            'findOneAndReplace',
+            'findByIdAndUpdate',
+            'findByIdAndDelete',
+            'findByIdAndRemove',
+            'findByIdAndReplace',
         ] as const;
 
         function attachQueryHooks(op: string) {
@@ -1243,10 +1475,10 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                         t0: Date.now(),
                         collection: this?.model?.collection?.name || 'unknown',
                         op,
-                        filter: safeJson(this.getFilter?.() ?? this._conditions ?? undefined),
-                        update: safeJson(this.getUpdate?.() ?? this._update ?? undefined),
-                        projection: safeJson(this.projection?.() ?? this._fields ?? undefined),
-                        options: safeJson(this.getOptions?.() ?? this.options ?? undefined),
+                        filter: sanitizeDbValue(this.getFilter?.() ?? this._conditions ?? undefined),
+                        update: sanitizeDbValue(this.getUpdate?.() ?? this._update ?? undefined),
+                        projection: sanitizeDbValue(this.projection?.() ?? this._fields ?? undefined),
+                        options: sanitizeDbValue(this.getOptions?.() ?? this.options ?? undefined),
                     };
                 } catch {
                     (this as any).__repro_qmeta = { t0: Date.now(), collection: 'unknown', op };
@@ -1275,6 +1507,66 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
         READ_OPS.forEach(attachQueryHooks);
         WRITE_OPS.forEach(attachQueryHooks);
 
+        // bulkWrite + insertMany (non-query middleware)
+        schema.pre<any>('insertMany' as any, { document: false, query: false } as any, function (this: any, next: Function, docs?: any[]) {
+            try {
+                (this as any).__repro_insert_meta = {
+                    t0: Date.now(),
+                    collection: this?.collection?.name || this?.model?.collection?.name || 'unknown',
+                    docs: sanitizeDbValue(docs),
+                };
+            } catch {
+                (this as any).__repro_insert_meta = { t0: Date.now(), collection: 'unknown' };
+            }
+            next();
+        } as any);
+
+        schema.post<any>('insertMany' as any, { document: false, query: false } as any, function (this: any, docs: any[]) {
+            const { sid, aid } = getCtx();
+            if (!sid) return;
+            const meta = (this as any).__repro_insert_meta || { t0: Date.now(), collection: 'unknown' };
+            const resultMeta = Array.isArray(docs) ? { inserted: docs.length } : summarizeQueryResult('insertMany', docs);
+
+            emitDbQuery(cfg, sid, aid, {
+                collection: meta.collection,
+                op: 'insertMany',
+                query: { docs: meta.docs ?? undefined },
+                resultMeta,
+                durMs: Date.now() - meta.t0,
+                t: alignedNow(),
+            });
+        } as any);
+
+        schema.pre<any>('bulkWrite' as any, { document: false, query: false } as any, function (this: any, next: Function, ops?: any[]) {
+            try {
+                (this as any).__repro_bulk_meta = {
+                    t0: Date.now(),
+                    collection: this?.collection?.name || this?.model?.collection?.name || 'unknown',
+                    ops: sanitizeDbValue(ops),
+                };
+            } catch {
+                (this as any).__repro_bulk_meta = { t0: Date.now(), collection: 'unknown' };
+            }
+            next();
+        } as any);
+
+        schema.post<any>('bulkWrite' as any, { document: false, query: false } as any, function (this: any, res: any) {
+            const { sid, aid } = getCtx();
+            if (!sid) return;
+            const meta = (this as any).__repro_bulk_meta || { t0: Date.now(), collection: 'unknown' };
+            const bulkResult = summarizeBulkResult(res);
+            const resultMeta = { ...bulkResult, result: sanitizeResultForMeta(res?.result ?? res) };
+
+            emitDbQuery(cfg, sid, aid, {
+                collection: meta.collection,
+                op: 'bulkWrite',
+                query: { ops: meta.ops ?? undefined },
+                resultMeta,
+                durMs: Date.now() - meta.t0,
+                t: alignedNow(),
+            });
+        } as any);
+
         // Aggregate middleware (non-intrusive)
         schema.pre('aggregate', function (this: any, next: Function) {
             try {
@@ -1285,7 +1577,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                         this?._model?.collection?.name ||
                         (this?.model && this.model.collection?.name) ||
                         'unknown',
-                    pipeline: safeJson(this.pipeline?.() ?? this._pipeline ?? undefined),
+                    pipeline: sanitizeDbValue(this.pipeline?.() ?? this._pipeline ?? undefined),
                 };
             } catch {
                 (this as any).__repro_aggmeta = { t0: Date.now(), collection: 'unknown', pipeline: undefined };
@@ -1315,7 +1607,13 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
 function summarizeQueryResult(op: string, res: any) {
     const resultPreview = sanitizeResultForMeta(res);
 
-    if (op === 'find' || op === 'findOne' || op === 'aggregate' || op === 'distinct' || op.startsWith('count')) {
+    if (
+        op === 'find' ||
+        op === 'findOne' ||
+        op === 'aggregate' ||
+        op === 'distinct' ||
+        op.startsWith('count')
+    ) {
         const summary: Record<string, any> = {};
         if (Array.isArray(res)) summary.docsCount = res.length;
         else if (res && typeof res === 'object' && typeof (res as any).toArray === 'function') summary.docsCount = undefined;
@@ -1326,6 +1624,17 @@ function summarizeQueryResult(op: string, res: any) {
             summary.result = resultPreview;
         }
         return summary;
+    }
+
+    if (op === 'insertMany') {
+        const summary: Record<string, any> = {};
+        if (Array.isArray(res)) summary.inserted = res.length;
+        if (typeof resultPreview !== 'undefined') summary.result = resultPreview;
+        return summary;
+    }
+
+    if (op === 'bulkWrite') {
+        return { ...summarizeBulkResult(res), result: resultPreview };
     }
 
     const stats = pickWriteStats(res);

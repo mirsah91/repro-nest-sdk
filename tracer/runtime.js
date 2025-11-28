@@ -136,12 +136,8 @@ const trace = {
 
         if (!baseDetail.threw) {
             const rv = baseDetail.returnValue;
-            if (isThenable(rv) && !forceUnawaited) {
-                if (isMongooseQuery(rv)) {
-                    emitExit({ unawaited: false });
-                    return;
-                }
-
+            const isQuery = isMongooseQuery(rv);
+            if (isThenable(rv) && !isQuery) {
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
@@ -158,6 +154,11 @@ const trace = {
                 } catch (err) {
                     finalize(undefined, true, err);
                 }
+                return;
+            }
+
+            if (isQuery) {
+                emitExit({ unawaited: forceUnawaited });
                 return;
             }
         }
