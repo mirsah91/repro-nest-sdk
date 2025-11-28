@@ -90,8 +90,7 @@ const trace = {
             returnValue: detail?.returnValue,
             error: detail?.error,
             threw: detail?.threw === true,
-            unawaited: detail?.unawaited === true || frameUnawaited,
-            late: detail?.late === true
+            unawaited: detail?.unawaited === true || frameUnawaited
         };
 
         const promiseTaggedUnawaited = !!(baseDetail.returnValue && baseDetail.returnValue[SYM_UNAWAITED]);
@@ -111,9 +110,6 @@ const trace = {
                 unawaited: overrides.hasOwnProperty('unawaited')
                     ? overrides.unawaited
                     : forceUnawaited,
-                late: overrides.hasOwnProperty('late')
-                    ? overrides.late
-                    : baseDetail.late,
                 args: overrides.hasOwnProperty('args')
                     ? overrides.args
                     : baseDetail.args
@@ -132,8 +128,7 @@ const trace = {
                 threw: finalDetail.threw === true,
                 error: finalDetail.error,
                 args: finalDetail.args,
-                unawaited: finalDetail.unawaited === true,
-                late: finalDetail.late === true
+                unawaited: finalDetail.unawaited === true
             });
         };
 
@@ -148,36 +143,11 @@ const trace = {
                     return;
                 }
 
-                if (forceUnawaited) {
-                    emitExit({
-                        returnValue: { __type: 'Promise', state: 'pending' },
-                        unawaited: true,
-                        late: false
-                    });
-                    let settled = false;
-                    const finalize = (value, threw, error) => {
-                        if (settled) return value;
-                        settled = true;
-                        emitExit({ returnValue: value, threw, error, unawaited: true, late: true });
-                        return value;
-                    };
-
-                    try {
-                        rv.then(
-                            value => finalize(value, false, null),
-                            err => finalize(undefined, true, err)
-                        );
-                    } catch (err) {
-                        finalize(undefined, true, err);
-                    }
-                    return;
-                }
-
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
                     settled = true;
-                    emitExit({ returnValue: value, threw, error });
+                    emitExit({ returnValue: value, threw, error, unawaited: forceUnawaited });
                     return value;
                 };
 
