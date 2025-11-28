@@ -7,6 +7,7 @@ let EMITTING = false;
 const quietEnv = process.env.TRACE_QUIET === '1';
 const DEBUG_UNAWAITED = process.env.TRACE_DEBUG_UNAWAITED !== '0';
 let functionLogsEnabled = !quietEnv;
+let SPAN_COUNTER = 0;
 
 // ---- console patch: trace console.* as top-level calls (safe; no recursion) ----
 let CONSOLE_PATCHED = false;
@@ -41,9 +42,23 @@ function isMongooseQuery(value) {
     );
 }
 
+function pushSpan(ctx) {
+    const stack = ctx.__repro_span_stack || (ctx.__repro_span_stack = []);
+    const parent = stack.length ? stack[stack.length - 1] : null;
+    const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null };
+    stack.push(span);
+    return span;
+}
+
+function popSpan(ctx) {
+    const stack = ctx.__repro_span_stack;
+    if (!Array.isArray(stack) || !stack.length) return { id: null, parentId: null };
+    return stack.pop() || { id: null, parentId: null };
+}
+
 const trace = {
     on(fn){ listeners.add(fn); return () => listeners.delete(fn); },
-    withTrace(id, fn){ return als.run({ traceId: id, depth: 0 }, fn); },
+    withTrace(id, fn, depth = 0){ return als.run({ traceId: id, depth }, fn); },
     enter(fn, meta, detail){
         const ctx = als.getStore() || {};
         ctx.depth = (ctx.depth || 0) + 1;
@@ -60,6 +75,8 @@ const trace = {
         }
         frameStack.push(frameUnawaited);
 
+        const span = pushSpan(ctx);
+
         emit({
             type: 'enter',
             t: Date.now(),
@@ -69,7 +86,9 @@ const trace = {
             functionType: meta?.functionType || null,
             traceId: ctx.traceId,
             depth: ctx.depth,
-            args: detail?.args
+            args: detail?.args,
+            spanId: span.id,
+            parentSpanId: span.parentId
         });
     },
     exit(meta, detail){
@@ -86,6 +105,7 @@ const trace = {
         const frameUnawaited = Array.isArray(frameStack) && frameStack.length
             ? !!frameStack.pop()
             : false;
+        const spanInfo = popSpan(ctx);
         const baseDetail = {
             args: detail?.args,
             returnValue: detail?.returnValue,
@@ -130,6 +150,8 @@ const trace = {
                 functionType: baseMeta.functionType || null,
                 traceId: traceIdAtExit,
                 depth: depthAtExit,
+                spanId: spanInfo.id,
+                parentSpanId: spanInfo.parentId,
                 returnValue: finalDetail.returnValue,
                 threw: finalDetail.threw === true,
                 error: finalDetail.error,

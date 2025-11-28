@@ -111,6 +111,8 @@ type TraceEventRecord = {
     file?: string;
     line?: number | null;
     depth?: number;
+    spanId?: string | number | null;
+    parentSpanId?: string | number | null;
     args?: any;
     returnValue?: any;
     threw?: boolean;
@@ -600,6 +602,8 @@ function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
                 line: ev.line,
                 functionType: ev.functionType,
                 depth: typeof ev.depth === 'number' ? Math.max(0, ev.depth - 1) : ev.depth,
+                spanId: ev.spanId ?? null,
+                parentSpanId: ev.parentSpanId ?? null,
                 args: ev.args,
                 returnValue: undefined,
                 threw: false,
@@ -610,6 +614,81 @@ function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
     }
 
     return balanced;
+}
+
+function reorderTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
+    if (!Array.isArray(events) || !events.length) return events;
+
+    type SpanNode = {
+        id: string;
+        parentId: string | null;
+        enter?: TraceEventRecord;
+        exit?: TraceEventRecord;
+        children: SpanNode[];
+        order: number;
+    };
+
+    const nodes = new Map<string, SpanNode>();
+    const roots: Array<SpanNode | { order: number; ev: TraceEventRecord }> = [];
+
+    const normalizeId = (v: any) => (v === null || v === undefined ? null : String(v));
+
+    const ensureNode = (id: string): SpanNode => {
+        let n = nodes.get(id);
+        if (!n) {
+            n = { id, parentId: null, children: [], order: Number.POSITIVE_INFINITY };
+            nodes.set(id, n);
+        }
+        return n;
+    };
+
+    events.forEach((ev, idx) => {
+        const spanId = normalizeId(ev.spanId);
+        const parentId = normalizeId(ev.parentSpanId);
+        if (!spanId) {
+            roots.push({ order: idx, ev });
+            return;
+        }
+        const node = ensureNode(spanId);
+        node.order = Math.min(node.order, idx);
+        node.parentId = parentId;
+        if (ev.type === 'enter') node.enter = node.enter ?? ev;
+        if (ev.type === 'exit') node.exit = ev;
+    });
+
+    nodes.forEach(node => {
+        if (node.parentId && nodes.has(node.parentId)) {
+            const parent = nodes.get(node.parentId)!;
+            parent.children.push(node);
+        } else {
+            roots.push(node);
+        }
+    });
+
+    const sortChildren = (node: SpanNode) => {
+        node.children.sort((a, b) => a.order - b.order);
+        node.children.forEach(sortChildren);
+    };
+    nodes.forEach(sortChildren);
+
+    roots.sort((a, b) => a.order - b.order);
+
+    const out: TraceEventRecord[] = [];
+    const emitNode = (node: SpanNode) => {
+        if (node.enter) out.push(node.enter);
+        node.children.forEach(emitNode);
+        if (node.exit) out.push(node.exit);
+    };
+
+    roots.forEach(entry => {
+        if ('ev' in entry) {
+            out.push(entry.ev);
+        } else {
+            emitNode(entry as SpanNode);
+        }
+    });
+
+    return out;
 }
 
 function getCollectionNameFromDoc(doc: any): string | undefined {
@@ -1184,6 +1263,8 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 file: ev.file,
                                 line: ev.line,
                                 depth: ev.depth,
+                                spanId: ev.spanId ?? null,
+                                parentSpanId: ev.parentSpanId ?? null,
                             };
 
                             if (ev.functionType !== undefined) {
@@ -1250,7 +1331,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 }
 
                 const flushPayload = () => {
-                    const balancedEvents = balanceTraceEvents(events.slice());
+                    const balancedEvents = reorderTraceEvents(balanceTraceEvents(events.slice()));
                     const summary = summarizeEndpointFromEvents(balancedEvents);
                     const chosenEndpoint = summary.endpointTrace
                         ?? summary.preferredAppTrace
