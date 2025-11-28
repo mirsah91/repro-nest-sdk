@@ -35,6 +35,12 @@ function isThenable(value) {
     return value != null && typeof value.then === 'function';
 }
 
+function isNativeFunction(fn) {
+    if (!fn || typeof fn !== 'function') return false;
+    try { return /\{\s*\[native code\]\s*\}/.test(Function.prototype.toString.call(fn)); }
+    catch { return false; }
+}
+
 function isMongooseQuery(value) {
     return (
         isThenable(value) &&
@@ -354,6 +360,10 @@ function markPromiseUnawaited(value) {
     }
 }
 
+const CWD = process.cwd().replace(/\\/g, '/');
+const isNodeModulesPath = (p) => !!p && p.replace(/\\/g, '/').includes('/node_modules/');
+const isAppPath = (p) => !!p && p.replace(/\\/g, '/').startsWith(CWD + '/') && !isNodeModulesPath(p);
+
 function isProbablyAsyncFunction(fn) {
     if (!fn || typeof fn !== 'function') return false;
     const ctorName = fn.constructor && fn.constructor.name;
@@ -390,8 +400,17 @@ if (!global.__repro_call) {
                 }
 
                 const currentStore = als.getStore();
-                const isApp = fn[SYM_IS_APP] === true;
-                const shouldFork = !!(currentStore && isUnawaitedCall && isApp);
+                const sourceFile = fn[SYM_SRC_FILE];
+                let isApp = fn[SYM_IS_APP] === true;
+                if (!isApp) {
+                    const appBySource = isAppPath(sourceFile);
+                    const appByCall = !appBySource && isAppPath(callFile);
+                    if ((appBySource || appByCall) && !isNativeFunction(fn)) {
+                        isApp = true;
+                        try { Object.defineProperty(fn, SYM_IS_APP, { value: true, configurable: true }); } catch {}
+                    }
+                }
+                const shouldFork = !!(currentStore && isUnawaitedCall);
                 const runWithStore = (fnToRun) => {
                     if (shouldFork) {
                         const forked = forkAlsStoreForUnawaited(currentStore);
