@@ -5,7 +5,8 @@ const als = new AsyncLocalStorage(); // { traceId, depth }
 const listeners = new Set();
 let EMITTING = false;
 const quietEnv = process.env.TRACE_QUIET === '1';
-const DEBUG_UNAWAITED = process.env.TRACE_DEBUG_UNAWAITED !== '0';
+// Off by default; set TRACE_DEBUG_UNAWAITED=1 to log unawaited enter/exit debug noise.
+const DEBUG_UNAWAITED = process.env.TRACE_DEBUG_UNAWAITED === '1';
 let functionLogsEnabled = !quietEnv;
 let SPAN_COUNTER = 0;
 
@@ -353,6 +354,15 @@ function markPromiseUnawaited(value) {
     }
 }
 
+function isProbablyAsyncFunction(fn) {
+    if (!fn || typeof fn !== 'function') return false;
+    const ctorName = fn.constructor && fn.constructor.name;
+    if (ctorName === 'AsyncFunction' || ctorName === 'AsyncGeneratorFunction') return true;
+    const tag = fn[Symbol.toStringTag];
+    if (tag === 'AsyncFunction' || tag === 'AsyncGeneratorFunction') return true;
+    return false;
+}
+
 function forkAlsStoreForUnawaited(baseStore) {
     if (!baseStore) return null;
     const cloned = { ...baseStore };
@@ -380,7 +390,8 @@ if (!global.__repro_call) {
                 }
 
                 const currentStore = als.getStore();
-                const shouldFork = !!(currentStore && isUnawaitedCall);
+                const isApp = fn[SYM_IS_APP] === true;
+                const shouldFork = !!(currentStore && isUnawaitedCall && isApp && isProbablyAsyncFunction(fn));
                 const runWithStore = (fnToRun) => {
                     if (shouldFork) {
                         const forked = forkAlsStoreForUnawaited(currentStore);
@@ -390,7 +401,6 @@ if (!global.__repro_call) {
                 };
 
                 return runWithStore(() => {
-                    const isApp = fn[SYM_IS_APP] === true;
                     if (isApp) {
                         const ctx = als.getStore();
                         let pendingMarker = null;
