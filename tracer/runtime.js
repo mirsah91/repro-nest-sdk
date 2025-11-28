@@ -75,6 +75,7 @@ const trace = {
     exit(meta, detail){
         const ctx = als.getStore() || {};
         const depthAtExit = ctx.depth || 0;
+        const traceIdAtExit = ctx.traceId;
         const baseMeta = {
             fn: meta?.fn,
             file: meta?.file,
@@ -95,6 +96,11 @@ const trace = {
 
         const promiseTaggedUnawaited = !!(baseDetail.returnValue && baseDetail.returnValue[SYM_UNAWAITED]);
         const forceUnawaited = baseDetail.unawaited || promiseTaggedUnawaited;
+
+        const runWithExitCtx = (fn) => {
+            if (!traceIdAtExit) return fn();
+            return als.run({ traceId: traceIdAtExit, depth: depthAtExit }, fn);
+        };
 
         const emitExit = (overrides = {}) => {
             const finalDetail = {
@@ -122,7 +128,7 @@ const trace = {
                 file: baseMeta.file,
                 line: baseMeta.line,
                 functionType: baseMeta.functionType || null,
-                traceId: ctx.traceId,
+                traceId: traceIdAtExit,
                 depth: depthAtExit,
                 returnValue: finalDetail.returnValue,
                 threw: finalDetail.threw === true,
@@ -147,7 +153,7 @@ const trace = {
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
                     settled = true;
-                    emitExit({ returnValue: value, threw, error, unawaited: forceUnawaited });
+                    runWithExitCtx(() => emitExit({ returnValue: value, threw, error, unawaited: forceUnawaited }));
                     return value;
                 };
 
@@ -163,7 +169,7 @@ const trace = {
             }
 
             if (isQuery) {
-                emitExit({ unawaited: forceUnawaited });
+                runWithExitCtx(() => emitExit({ unawaited: forceUnawaited }));
                 return;
             }
         }
@@ -171,7 +177,7 @@ const trace = {
         if (DEBUG_UNAWAITED) {
             try { process.stderr.write(`[unawaited] exit ${baseMeta.fn} -> ${forceUnawaited}\n`); } catch {}
         }
-        emitExit({ unawaited: forceUnawaited });
+        runWithExitCtx(() => emitExit({ unawaited: forceUnawaited }));
     }
 };
 global.__trace = trace; // called by injected code
