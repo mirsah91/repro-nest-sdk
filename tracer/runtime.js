@@ -42,18 +42,18 @@ function isMongooseQuery(value) {
     );
 }
 
-function pushSpan(ctx) {
+function pushSpan(ctx, depth) {
     const stack = ctx.__repro_span_stack || (ctx.__repro_span_stack = []);
     const parent = stack.length ? stack[stack.length - 1] : null;
-    const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null };
+    const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null, depth };
     stack.push(span);
     return span;
 }
 
 function popSpan(ctx) {
     const stack = ctx.__repro_span_stack;
-    if (!Array.isArray(stack) || !stack.length) return { id: null, parentId: null };
-    return stack.pop() || { id: null, parentId: null };
+    if (!Array.isArray(stack) || !stack.length) return { id: null, parentId: null, depth: null };
+    return stack.pop() || { id: null, parentId: null, depth: null };
 }
 
 const trace = {
@@ -75,7 +75,7 @@ const trace = {
         }
         frameStack.push(frameUnawaited);
 
-        const span = pushSpan(ctx);
+        const span = pushSpan(ctx, ctx.depth);
 
         emit({
             type: 'enter',
@@ -120,7 +120,7 @@ const trace = {
 
         const runWithExitCtx = (fn) => {
             if (!traceIdAtExit) return fn();
-            const store = { traceId: traceIdAtExit, depth: depthAtExit, __repro_span_stack: spanStack.slice() };
+            const store = { traceId: traceIdAtExit, depth: spanInfo.depth ?? depthAtExit, __repro_span_stack: spanStack.slice() };
             return als.run(store, fn);
         };
 
@@ -151,7 +151,7 @@ const trace = {
                 line: baseMeta.line,
                 functionType: baseMeta.functionType || null,
                 traceId: traceIdAtExit,
-                depth: depthAtExit,
+                depth: spanInfo.depth ?? depthAtExit,
                 spanId: spanInfo.id,
                 parentSpanId: spanInfo.parentId,
                 returnValue: finalDetail.returnValue,
