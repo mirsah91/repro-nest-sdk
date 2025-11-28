@@ -137,7 +137,17 @@ const trace = {
         if (!baseDetail.threw) {
             const rv = baseDetail.returnValue;
             const isQuery = isMongooseQuery(rv);
-            if (isThenable(rv) && !isQuery) {
+            if (isThenable(rv)) {
+                if (forceUnawaited) {
+                    emitExit({ returnValue: { __type: 'Promise', state: 'pending' }, unawaited: true });
+                    return;
+                }
+
+                if (isQuery) {
+                    emitExit({ unawaited: forceUnawaited });
+                    return;
+                }
+
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
