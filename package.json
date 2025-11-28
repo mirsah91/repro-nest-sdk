@@ -11,7 +11,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepublishOnly": "npm run build",
-    "test": "node tmp/unawaited.test.js"
+    "test": "npm run build && node tmp/unawaited.test.js && node tmp/integration-unawaited.js"
   },
   "peerDependencies": {
     "express": "^5.1.0",

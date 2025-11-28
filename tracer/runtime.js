@@ -105,6 +105,7 @@ const trace = {
         const frameUnawaited = Array.isArray(frameStack) && frameStack.length
             ? !!frameStack.pop()
             : false;
+        const spanStack = Array.isArray(ctx.__repro_span_stack) ? ctx.__repro_span_stack.slice() : [];
         const spanInfo = popSpan(ctx);
         const baseDetail = {
             args: detail?.args,
@@ -119,7 +120,8 @@ const trace = {
 
         const runWithExitCtx = (fn) => {
             if (!traceIdAtExit) return fn();
-            return als.run({ traceId: traceIdAtExit, depth: depthAtExit }, fn);
+            const store = { traceId: traceIdAtExit, depth: depthAtExit, __repro_span_stack: spanStack.slice() };
+            return als.run(store, fn);
         };
 
         const emitExit = (overrides = {}) => {
@@ -413,7 +415,7 @@ if (!global.__repro_call) {
                     if (shouldForceExit) markPromiseUnawaited(out);
 
                     if (isThenableValue) {
-                        if (isQuery || shouldForceExit) {
+                        if (isQuery) {
                             trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
                             return out;
                         }
