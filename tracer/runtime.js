@@ -391,7 +391,7 @@ if (!global.__repro_call) {
 
                 const currentStore = als.getStore();
                 const isApp = fn[SYM_IS_APP] === true;
-                const shouldFork = !!(currentStore && isUnawaitedCall && isApp && isProbablyAsyncFunction(fn));
+                const shouldFork = !!(currentStore && isUnawaitedCall && isApp);
                 const runWithStore = (fnToRun) => {
                     if (shouldFork) {
                         const forked = forkAlsStoreForUnawaited(currentStore);
