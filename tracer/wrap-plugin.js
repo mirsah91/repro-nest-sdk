@@ -273,7 +273,6 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             if (p.isObjectProperty && p.isObjectProperty()) return true;
             if (p.isObjectMethod && p.isObjectMethod()) return true;
             if (p.isSpreadElement && p.isSpreadElement()) return true;
-            if (p.isCallExpression && p.isCallExpression()) return true;
             if (p.isNewExpression && p.isNewExpression()) return true;
             if (p.isMemberExpression && p.isMemberExpression()) return true;
             if (p.isOptionalMemberExpression && p.isOptionalMemberExpression()) return true;
