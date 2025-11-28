@@ -353,6 +353,21 @@ function markPromiseUnawaited(value) {
     }
 }
 
+function forkAlsStoreForUnawaited(baseStore) {
+    if (!baseStore) return null;
+    const cloned = { ...baseStore };
+    if (Array.isArray(baseStore.__repro_span_stack)) {
+        cloned.__repro_span_stack = baseStore.__repro_span_stack.slice();
+    }
+    if (Array.isArray(baseStore.__repro_frame_unawaited)) {
+        cloned.__repro_frame_unawaited = baseStore.__repro_frame_unawaited.slice();
+    }
+    if (Array.isArray(baseStore.__repro_pending_unawaited)) {
+        cloned.__repro_pending_unawaited = baseStore.__repro_pending_unawaited.slice();
+    }
+    return cloned;
+}
+
 // ========= Generic call-site shim (used by Babel transform) =========
 // Decides whether to emit a top-level event based on callee origin tags.
 // No hardcoded library names or file paths.
@@ -364,94 +379,106 @@ if (!global.__repro_call) {
                     return fn.apply(thisArg, args);
                 }
 
-                const isApp = fn[SYM_IS_APP] === true;
-                if (isApp) {
-                    const ctx = als.getStore();
-                    let pendingMarker = null;
-                    if (ctx && isUnawaitedCall) {
-                        const queue = ctx.__repro_pending_unawaited || (ctx.__repro_pending_unawaited = []);
-                        pendingMarker = { unawaited: true, id: Symbol('unawaited') };
-                        queue.push(pendingMarker);
+                const currentStore = als.getStore();
+                const shouldFork = !!(currentStore && isUnawaitedCall);
+                const runWithStore = (fnToRun) => {
+                    if (shouldFork) {
+                        const forked = forkAlsStoreForUnawaited(currentStore);
+                        return als.run(forked, fnToRun);
                     }
+                    return fnToRun();
+                };
 
-                    try {
-                        const out = fn.apply(thisArg, args);
-                        if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
-                        return out;
-                    } finally {
-                        if (pendingMarker) {
-                            const store = als.getStore();
-                            const queue = store && store.__repro_pending_unawaited;
-                            if (Array.isArray(queue)) {
-                                const idx = queue.indexOf(pendingMarker);
-                                if (idx !== -1) queue.splice(idx, 1);
+                return runWithStore(() => {
+                    const isApp = fn[SYM_IS_APP] === true;
+                    if (isApp) {
+                        const ctx = als.getStore();
+                        let pendingMarker = null;
+                        if (ctx && isUnawaitedCall) {
+                            const queue = ctx.__repro_pending_unawaited || (ctx.__repro_pending_unawaited = []);
+                            pendingMarker = { unawaited: true, id: Symbol('unawaited') };
+                            queue.push(pendingMarker);
+                        }
+
+                        try {
+                            const out = fn.apply(thisArg, args);
+                            if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
+                            return out;
+                        } finally {
+                            if (pendingMarker) {
+                                const store = als.getStore();
+                                const queue = store && store.__repro_pending_unawaited;
+                                if (Array.isArray(queue)) {
+                                    const idx = queue.indexOf(pendingMarker);
+                                    if (idx !== -1) queue.splice(idx, 1);
+                                }
                             }
                         }
                     }
-                }
 
-                const name = (label && label.length) || fn.name
-                    ? (label && label.length ? label : fn.name)
-                    : '(anonymous)';
-                const sourceFile = fn[SYM_SRC_FILE];
-                const meta = {
-                    file: sourceFile || callFile || null,
-                    line: sourceFile ? null : (callLine || null)
-                };
-
-                trace.enter(name, meta, { args });
-                try {
-                    const out = fn.apply(thisArg, args);
-
-                    const isThenableValue = isThenable(out);
-                    const isQuery = isMongooseQuery(out);
-                    const shouldForceExit = !!isUnawaitedCall && isThenableValue;
-                    const exitDetailBase = {
-                        returnValue: out,
-                        args,
-                        unawaited: shouldForceExit
+                    const name = (label && label.length) || fn.name
+                        ? (label && label.length ? label : fn.name)
+                        : '(anonymous)';
+                    const sourceFile = fn[SYM_SRC_FILE];
+                    const meta = {
+                        file: sourceFile || callFile || null,
+                        line: sourceFile ? null : (callLine || null)
                     };
 
-                    if (shouldForceExit) markPromiseUnawaited(out);
+                    trace.enter(name, meta, { args });
+                    try {
+                        const out = fn.apply(thisArg, args);
 
-                    if (isThenableValue) {
-                        if (isQuery) {
-                            trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
+                        const isThenableValue = isThenable(out);
+                        const isQuery = isMongooseQuery(out);
+                        const shouldForceExit = !!isUnawaitedCall && isThenableValue;
+                        const exitDetailBase = {
+                            returnValue: out,
+                            args,
+                            unawaited: shouldForceExit
+                        };
+
+                        if (shouldForceExit) markPromiseUnawaited(out);
+
+                        if (isThenableValue) {
+                            if (isQuery) {
+                                trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
+                                return out;
+                            }
+
+                            let settled = false;
+                            const finalize = (value, threw, error) => {
+                                if (settled) return value;
+                                settled = true;
+                                const detail = {
+                                    returnValue: value,
+                                    args,
+                                    threw,
+                                    error
+                                };
+                                trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
+                                return value;
+                            };
+
+                            try {
+                                out.then(
+                                    value => finalize(value, false, null),
+                                    err => finalize(undefined, true, err)
+                                );
+                            } catch (err) {
+                                finalize(undefined, true, err);
+                            }
                             return out;
                         }
 
-                        let settled = false;
-                        const finalize = (value, threw, error) => {
-                            if (settled) return value;
-                            settled = true;
-                            const detail = {
-                                returnValue: value,
-                                args,
-                                threw,
-                                error
-                            };
-                            trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
-                            return value;
-                        };
-
-                        try {
-                            out.then(
-                                value => finalize(value, false, null),
-                                err => finalize(undefined, true, err)
-                            );
-                        } catch (err) {
-                            finalize(undefined, true, err);
-                        }
+                        // Non-thenable: close span now
+                        trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
                         return out;
+                    } catch (e) {
+                        trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
+                        throw e;
                     }
-
-                    // Non-thenable: close span now
-                    trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
-                    return out;
-                } catch (e) {
-                    trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
-                    throw e;
-                }
+                });
             } catch {
                 return fn ? fn.apply(thisArg, args) : undefined;
             }
