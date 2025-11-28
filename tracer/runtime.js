@@ -460,11 +460,11 @@ if (!global.__repro_call) {
 
                         const isThenableValue = isThenable(out);
                         const isQuery = isMongooseQuery(out);
-                        const shouldForceExit = !!isUnawaitedCall && isThenableValue;
-                        const exitDetailBase = {
-                            returnValue: out,
-                            args,
-                            unawaited: shouldForceExit
+                    const shouldForceExit = !!isUnawaitedCall && isThenableValue;
+                    const exitDetailBase = {
+                        returnValue: out,
+                        args,
+                        unawaited: shouldForceExit
                         };
 
                         if (shouldForceExit) markPromiseUnawaited(out);
@@ -479,15 +479,16 @@ if (!global.__repro_call) {
                             const finalize = (value, threw, error) => {
                                 if (settled) return value;
                                 settled = true;
-                                const detail = {
-                                    returnValue: value,
-                                    args,
-                                    threw,
-                                    error
-                                };
-                                trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
-                                return value;
+                            const detail = {
+                                returnValue: value,
+                                args,
+                                threw,
+                                error,
+                                unawaited: shouldForceExit
                             };
+                            trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
+                            return value;
+                        };
 
                             try {
                                 out.then(
