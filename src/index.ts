@@ -626,6 +626,8 @@ function reorderTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
         exit?: TraceEventRecord;
         children: SpanNode[];
         order: number;
+        enterTime?: number;
+        exitTime?: number;
     };
 
     const nodes = new Map<string, SpanNode>();
@@ -651,6 +653,12 @@ function reorderTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
         }
         const node = ensureNode(spanId);
         node.order = Math.min(node.order, idx);
+        if (ev.type === 'enter') {
+            node.enterTime = node.enterTime ?? ev.t;
+        }
+        if (ev.type === 'exit') {
+            node.exitTime = ev.t;
+        }
         node.parentId = parentId;
         if (ev.type === 'enter') node.enter = node.enter ?? ev;
         if (ev.type === 'exit') node.exit = ev;
@@ -659,6 +667,13 @@ function reorderTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
     nodes.forEach(node => {
         if (node.parentId && nodes.has(node.parentId)) {
             const parent = nodes.get(node.parentId)!;
+            const childTime = node.enterTime ?? node.exitTime ?? Number.POSITIVE_INFINITY;
+            const parentExit = parent.exitTime ?? Number.POSITIVE_INFINITY;
+            // If parent already exited before child began, treat child as a root to avoid mis-parenting.
+            if (parentExit !== Number.POSITIVE_INFINITY && parentExit < childTime) {
+                roots.push(node);
+                return;
+            }
             parent.children.push(node);
         } else {
             roots.push(node);
