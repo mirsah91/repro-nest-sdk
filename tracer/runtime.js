@@ -165,11 +165,14 @@ const trace = {
             });
         };
 
-        const emitNow = (overrides = {}) => {
-            const spanStackCopy = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
-            const popped = popSpan(ctx);
-            const spanForExit = popped && popped.id != null ? popped : spanInfoPeek;
-            ctx.depth = Math.max(0, depthAtExit - 1);
+        const emitNow = (overrides = {}, spanForExitOverride = null, spanStackForExitOverride = null) => {
+            const spanStackCopy = spanStackForExitOverride
+                ? spanStackForExitOverride.slice()
+                : Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
+            const spanForExit = spanForExitOverride
+                ? spanForExitOverride
+                : (popSpan(ctx) || spanInfoPeek);
+            ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
 
             const fn = () => emitExit(spanForExit, overrides);
             if (!traceIdAtExit) return fn();
@@ -182,32 +185,27 @@ const trace = {
             const isQuery = isMongooseQuery(rv);
 
             if (isThenable(rv)) {
+                // Detach span immediately so downstream sync work doesn't inherit it.
+                const spanStackForExit = Array.isArray(ctx.__repro_span_stack)
+                    ? ctx.__repro_span_stack.slice()
+                    : Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
+                const spanForExit = popSpan(ctx) || spanInfoPeek;
+                ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
+
+                // Mongoose queries: never await (would re-exec). Emit best-effort now.
                 if (isQuery) {
-                    emitNow({ unawaited: forceUnawaited });
+                    emitNow({ unawaited: forceUnawaited, returnValue: rv }, spanForExit, spanStackForExit);
                     return;
                 }
 
-                // For fire-and-forget calls (not queries), close immediately.
-                if (forceUnawaited && !isQuery) {
-                    emitNow({ unawaited: true, returnValue: rv });
-                    return;
-                }
-
+                // Non-query thenables: capture resolved value; mark unawaited if applicable.
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
                     settled = true;
-
-                    const spanStackForExit = Array.isArray(ctx.__repro_span_stack)
-                        ? ctx.__repro_span_stack.slice()
-                        : Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
-                    const popped = popSpan(ctx);
-                    const spanForExit = popped && popped.id != null ? popped : spanInfoPeek;
-                    ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
-
                     const fn = () => emitExit(spanForExit, { returnValue: value, threw, error, unawaited: forceUnawaited });
                     if (!traceIdAtExit) return fn();
-                    const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit };
+                    const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit.slice() };
                     return als.run(store, fn);
                 };
 
