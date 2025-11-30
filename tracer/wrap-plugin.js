@@ -143,10 +143,26 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
         const TS_HELPER_NAMES = new Set(['__awaiter', '__generator']);
 
+        function isAwaiterBody(path) {
+            if (!path.parentPath) return false;
+            if (!path.parentPath.isCallExpression()) return false;
+            const call = path.parentPath.node;
+            const callee = call.callee;
+            const isHelper = t.isIdentifier(callee, { name: '__awaiter' }) || t.isIdentifier(callee, { name: '__generator' });
+            if (!isHelper) return false;
+            if (path.listKey !== 'arguments') return false;
+            const argIndex = typeof path.key === 'number' ? path.key : -1;
+            return argIndex === call.arguments.length - 1;
+        }
+
         function wrap(path){
             const n = path.node;
             if (n.__wrapped) return;
 
+            if (isAwaiterBody(path)) {
+                // Don't wrap the generator passed to __awaiter/__generator; we still want to instrument its callsites.
+                return;
+            }
             const name = nameFor(path);
             if (TS_HELPER_NAMES.has(name)) {
                 markInternal(n);
@@ -336,6 +352,8 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
             // Skip our helper, super(), import(), optional calls for now
             if (t.isIdentifier(n.callee, { name: '__repro_call' })) return;
+            if (t.isIdentifier(n.callee, { name: '__awaiter' })) return;
+            if (t.isIdentifier(n.callee, { name: '__generator' })) return;
             if (t.isSuper(n.callee)) return;
             if (t.isImport(n.callee)) return;
             if (n.optional === true) return;
