@@ -112,8 +112,10 @@ const trace = {
         const frameUnawaited = Array.isArray(frameStack) && frameStack.length
             ? !!frameStack.pop()
             : false;
-        const spanStack = Array.isArray(ctx.__repro_span_stack) ? ctx.__repro_span_stack.slice() : [];
-        const spanInfo = popSpan(ctx);
+        const spanStackRef = Array.isArray(ctx.__repro_span_stack) ? ctx.__repro_span_stack : [];
+        const spanInfoPeek = spanStackRef.length
+            ? spanStackRef[spanStackRef.length - 1]
+            : { id: null, parentId: null, depth: depthAtExit };
         const baseDetail = {
             args: detail?.args,
             returnValue: detail?.returnValue,
@@ -125,13 +127,7 @@ const trace = {
         const promiseTaggedUnawaited = !!(baseDetail.returnValue && baseDetail.returnValue[SYM_UNAWAITED]);
         const forceUnawaited = baseDetail.unawaited || promiseTaggedUnawaited;
 
-        const runWithExitCtx = (fn) => {
-            if (!traceIdAtExit) return fn();
-            const store = { traceId: traceIdAtExit, depth: spanInfo.depth ?? depthAtExit, __repro_span_stack: spanStack.slice() };
-            return als.run(store, fn);
-        };
-
-        const emitExit = (overrides = {}) => {
+        const emitExit = (spanInfo, overrides = {}) => {
             const finalDetail = {
                 returnValue: overrides.hasOwnProperty('returnValue')
                     ? overrides.returnValue
@@ -169,23 +165,53 @@ const trace = {
             });
         };
 
-        ctx.depth = Math.max(0, depthAtExit - 1);
+        const emitNow = (overrides = {}) => {
+            const spanStackCopy = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
+            const popped = popSpan(ctx);
+            const spanForExit = popped && popped.id != null ? popped : spanInfoPeek;
+            ctx.depth = Math.max(0, depthAtExit - 1);
+
+            const fn = () => emitExit(spanForExit, overrides);
+            if (!traceIdAtExit) return fn();
+            const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackCopy };
+            return als.run(store, fn);
+        };
 
         if (!baseDetail.threw) {
             const rv = baseDetail.returnValue;
             const isQuery = isMongooseQuery(rv);
+
             if (isThenable(rv)) {
                 if (isQuery) {
-                    emitExit({ unawaited: forceUnawaited });
+                    emitNow({ unawaited: forceUnawaited });
                     return;
                 }
+
+                // Keep the original store (with span) for promise callbacks, but move the caller onto
+                // a popped clone so downstream synchronous work isn't parented under this frame.
+                const callerStore = forkAlsStoreForUnawaited(ctx) || { ...ctx };
+                const callerSpanStack = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
+                callerStore.__repro_span_stack = callerSpanStack;
+                popSpan(callerStore);
+                callerStore.depth = Math.max(0, depthAtExit - 1);
+                try { als.enterWith(callerStore); } catch {}
 
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
                     settled = true;
-                    runWithExitCtx(() => emitExit({ returnValue: value, threw, error, unawaited: forceUnawaited }));
-                    return value;
+
+                    const spanStackForExit = Array.isArray(ctx.__repro_span_stack)
+                        ? ctx.__repro_span_stack.slice()
+                        : callerSpanStack.slice();
+                    const popped = popSpan(ctx);
+                    const spanForExit = popped && popped.id != null ? popped : spanInfoPeek;
+                    ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
+
+                    const fn = () => emitExit(spanForExit, { returnValue: value, threw, error, unawaited: forceUnawaited });
+                    if (!traceIdAtExit) return fn();
+                    const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit };
+                    return als.run(store, fn);
                 };
 
                 try {
@@ -200,7 +226,7 @@ const trace = {
             }
 
             if (isQuery) {
-                runWithExitCtx(() => emitExit({ unawaited: forceUnawaited }));
+                emitNow({ unawaited: forceUnawaited });
                 return;
             }
         }
@@ -208,7 +234,7 @@ const trace = {
         if (DEBUG_UNAWAITED) {
             try { process.stderr.write(`[unawaited] exit ${baseMeta.fn} -> ${forceUnawaited}\n`); } catch {}
         }
-        runWithExitCtx(() => emitExit({ unawaited: forceUnawaited }));
+        emitNow({ unawaited: forceUnawaited });
     }
 };
 global.__trace = trace; // called by injected code

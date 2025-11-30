@@ -84,6 +84,15 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                     if (t.isNumericLiteral(p)) return String(p.value);
                 }
             }
+            // Heuristic: generator passed to __awaiter — treat it as the enclosing function’s name
+            if (path.parentPath?.isCallExpression() &&
+                t.isIdentifier(path.parentPath.node.callee, { name: '__awaiter' })) {
+                const enclosing = path.getFunctionParent();
+                if (enclosing && enclosing.node !== path.node) {
+                    const enclosingName = nameFor(enclosing);
+                    if (enclosingName && enclosingName !== '(anonymous)') return enclosingName;
+                }
+            }
             return '(anonymous)';
         }
 
@@ -132,11 +141,18 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             return true; // mode 'all'
         }
 
+        const TS_HELPER_NAMES = new Set(['__awaiter', '__generator']);
+
         function wrap(path){
             const n = path.node;
             if (n.__wrapped) return;
 
             const name = nameFor(path);
+            if (TS_HELPER_NAMES.has(name)) {
+                markInternal(n);
+                path.skip(); // don’t instrument TS async helpers or their internals
+                return;
+            }
             if (!shouldWrap(path, name)) return;
 
             const loc = n.loc?.start || null;
