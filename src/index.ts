@@ -852,6 +852,8 @@ const TRACE_VALUE_MAX_ITEMS = 20;
 const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
 const TRACE_FLUSH_DELAY_MS = 20;
+// Extra grace period after res.finish to catch late fire-and-forget work before unsubscribing.
+const TRACE_LINGER_AFTER_FINISH_MS = 250;
 
 function isThenable(value: any): value is PromiseLike<any> {
     return value != null && typeof value === 'object' && typeof (value as any).then === 'function';
@@ -1398,7 +1400,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 };
 
                 if (__TRACER_READY) {
-                    setTimeout(scheduleFlush, TRACE_FLUSH_DELAY_MS);
+                    setTimeout(scheduleFlush, TRACE_FLUSH_DELAY_MS + TRACE_LINGER_AFTER_FINISH_MS);
                 } else {
                     scheduleFlush();
                 }
