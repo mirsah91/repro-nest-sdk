@@ -187,28 +187,25 @@ const trace = {
                     try {
                         process.stderr.write(`[trace-debug] unawaited immediate fn=${baseMeta.fn || '(anonymous)'} span=${spanInfoPeek.id ?? 'null'} parent=${spanInfoPeek.parentId ?? 'null'} depth=${spanInfoPeek.depth ?? depthAtExit}\n`);
                     } catch {}
-                    emitNow({ unawaited: true });
+                    emitNow({ unawaited: true, returnValue: rv });
                     return;
                 }
-
-                if (isQuery) {
-                    emitNow({ unawaited: forceUnawaited });
-                    return;
-                }
-
-                // Eagerly pop the span so awaited continuations don't inherit it.
-                const spanStackForExit = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
-                const spanForExit = popSpan(ctx) || spanInfoPeek;
-                ctx.depth = Math.max(0, depthAtExit - 1);
 
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
                     settled = true;
 
+                    const spanStackForExit = Array.isArray(ctx.__repro_span_stack)
+                        ? ctx.__repro_span_stack.slice()
+                        : Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
+                    const popped = popSpan(ctx);
+                    const spanForExit = popped && popped.id != null ? popped : spanInfoPeek;
+                    ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
+
                     const fn = () => emitExit(spanForExit, { returnValue: value, threw, error, unawaited: forceUnawaited });
                     if (!traceIdAtExit) return fn();
-                    const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit.slice() };
+                    const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit };
                     return als.run(store, fn);
                 };
 
