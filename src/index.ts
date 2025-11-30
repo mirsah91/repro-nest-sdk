@@ -674,17 +674,23 @@ function reorderTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
     roots.sort((a, b) => a.order - b.order);
 
     const out: TraceEventRecord[] = [];
-    const emitNode = (node: SpanNode) => {
-        if (node.enter) out.push(node.enter);
-        node.children.forEach(emitNode);
-        if (node.exit) out.push(node.exit);
+    const emitNode = (node: SpanNode, depth: number) => {
+        if (node.enter) {
+            node.enter.depth = depth;
+            out.push(node.enter);
+        }
+        node.children.forEach(child => emitNode(child, depth + 1));
+        if (node.exit) {
+            node.exit.depth = depth;
+            out.push(node.exit);
+        }
     };
 
     roots.forEach(entry => {
         if ('ev' in entry) {
             out.push(entry.ev);
         } else {
-            emitNode(entry as SpanNode);
+            emitNode(entry as SpanNode, 1);
         }
     });
 
