@@ -84,6 +84,15 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                     if (t.isNumericLiteral(p)) return String(p.value);
                 }
             }
+            // Heuristic: generator passed to __awaiter — treat it as the enclosing function’s name
+            if (path.parentPath?.isCallExpression() &&
+                t.isIdentifier(path.parentPath.node.callee, { name: '__awaiter' })) {
+                const enclosing = path.getFunctionParent();
+                if (enclosing && enclosing.node !== path.node) {
+                    const enclosingName = nameFor(enclosing);
+                    if (enclosingName && enclosingName !== '(anonymous)') return enclosingName;
+                }
+            }
             return '(anonymous)';
         }
 
@@ -132,11 +141,34 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             return true; // mode 'all'
         }
 
+        const TS_HELPER_NAMES = new Set(['__awaiter', '__generator']);
+
+        function isAwaiterBody(path) {
+            if (!path.parentPath) return false;
+            if (!path.parentPath.isCallExpression()) return false;
+            const call = path.parentPath.node;
+            const callee = call.callee;
+            const isHelper = t.isIdentifier(callee, { name: '__awaiter' }) || t.isIdentifier(callee, { name: '__generator' });
+            if (!isHelper) return false;
+            if (path.listKey !== 'arguments') return false;
+            const argIndex = typeof path.key === 'number' ? path.key : -1;
+            return argIndex === call.arguments.length - 1;
+        }
+
         function wrap(path){
             const n = path.node;
             if (n.__wrapped) return;
 
+            if (isAwaiterBody(path)) {
+                // Don't wrap the generator passed to __awaiter/__generator; we still want to instrument its callsites.
+                return;
+            }
             const name = nameFor(path);
+            if (TS_HELPER_NAMES.has(name)) {
+                markInternal(n);
+                path.skip(); // don’t instrument TS async helpers or their internals
+                return;
+            }
             if (!shouldWrap(path, name)) return;
 
             const loc = n.loc?.start || null;
@@ -273,7 +305,6 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             if (p.isObjectProperty && p.isObjectProperty()) return true;
             if (p.isObjectMethod && p.isObjectMethod()) return true;
             if (p.isSpreadElement && p.isSpreadElement()) return true;
-            if (p.isCallExpression && p.isCallExpression()) return true;
             if (p.isNewExpression && p.isNewExpression()) return true;
             if (p.isMemberExpression && p.isMemberExpression()) return true;
             if (p.isOptionalMemberExpression && p.isOptionalMemberExpression()) return true;
@@ -321,6 +352,8 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
             // Skip our helper, super(), import(), optional calls for now
             if (t.isIdentifier(n.callee, { name: '__repro_call' })) return;
+            if (t.isIdentifier(n.callee, { name: '__awaiter' })) return;
+            if (t.isIdentifier(n.callee, { name: '__generator' })) return;
             if (t.isSuper(n.callee)) return;
             if (t.isImport(n.callee)) return;
             if (n.optional === true) return;

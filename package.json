@@ -1,6 +1,6 @@
 {
   "name": "repro-nest",
-  "version": "0.0.89",
+  "version": "0.0.135",
   "description": "Repro Nest SDK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,7 +10,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test": "npm run build && node tmp/unawaited.test.js && node tmp/integration-unawaited.js"
   },
   "peerDependencies": {
     "express": "^5.1.0",

@@ -5,8 +5,10 @@ const als = new AsyncLocalStorage(); // { traceId, depth }
 const listeners = new Set();
 let EMITTING = false;
 const quietEnv = process.env.TRACE_QUIET === '1';
-const DEBUG_UNAWAITED = process.env.TRACE_DEBUG_UNAWAITED !== '0';
+// Off by default; set TRACE_DEBUG_UNAWAITED=1 to log unawaited enter/exit debug noise.
+const DEBUG_UNAWAITED = process.env.TRACE_DEBUG_UNAWAITED === '1';
 let functionLogsEnabled = !quietEnv;
+let SPAN_COUNTER = 0;
 
 // ---- console patch: trace console.* as top-level calls (safe; no recursion) ----
 let CONSOLE_PATCHED = false;
@@ -33,6 +35,12 @@ function isThenable(value) {
     return value != null && typeof value.then === 'function';
 }
 
+function isNativeFunction(fn) {
+    if (!fn || typeof fn !== 'function') return false;
+    try { return /\{\s*\[native code\]\s*\}/.test(Function.prototype.toString.call(fn)); }
+    catch { return false; }
+}
+
 function isMongooseQuery(value) {
     return (
         isThenable(value) &&
@@ -41,9 +49,23 @@ function isMongooseQuery(value) {
     );
 }
 
+function pushSpan(ctx, depth) {
+    const stack = ctx.__repro_span_stack || (ctx.__repro_span_stack = []);
+    const parent = stack.length ? stack[stack.length - 1] : null;
+    const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null, depth };
+    stack.push(span);
+    return span;
+}
+
+function popSpan(ctx) {
+    const stack = ctx.__repro_span_stack;
+    if (!Array.isArray(stack) || !stack.length) return { id: null, parentId: null, depth: null };
+    return stack.pop() || { id: null, parentId: null, depth: null };
+}
+
 const trace = {
     on(fn){ listeners.add(fn); return () => listeners.delete(fn); },
-    withTrace(id, fn){ return als.run({ traceId: id, depth: 0 }, fn); },
+    withTrace(id, fn, depth = 0){ return als.run({ traceId: id, depth }, fn); },
     enter(fn, meta, detail){
         const ctx = als.getStore() || {};
         ctx.depth = (ctx.depth || 0) + 1;
@@ -60,6 +82,8 @@ const trace = {
         }
         frameStack.push(frameUnawaited);
 
+        const span = pushSpan(ctx, ctx.depth);
+
         emit({
             type: 'enter',
             t: Date.now(),
@@ -69,12 +93,15 @@ const trace = {
             functionType: meta?.functionType || null,
             traceId: ctx.traceId,
             depth: ctx.depth,
-            args: detail?.args
+            args: detail?.args,
+            spanId: span.id,
+            parentSpanId: span.parentId
         });
     },
     exit(meta, detail){
         const ctx = als.getStore() || {};
         const depthAtExit = ctx.depth || 0;
+        const traceIdAtExit = ctx.traceId;
         const baseMeta = {
             fn: meta?.fn,
             file: meta?.file,
@@ -85,6 +112,10 @@ const trace = {
         const frameUnawaited = Array.isArray(frameStack) && frameStack.length
             ? !!frameStack.pop()
             : false;
+        const spanStackRef = Array.isArray(ctx.__repro_span_stack) ? ctx.__repro_span_stack : [];
+        const spanInfoPeek = spanStackRef.length
+            ? spanStackRef[spanStackRef.length - 1]
+            : { id: null, parentId: null, depth: depthAtExit };
         const baseDetail = {
             args: detail?.args,
             returnValue: detail?.returnValue,
@@ -96,7 +127,7 @@ const trace = {
         const promiseTaggedUnawaited = !!(baseDetail.returnValue && baseDetail.returnValue[SYM_UNAWAITED]);
         const forceUnawaited = baseDetail.unawaited || promiseTaggedUnawaited;
 
-        const emitExit = (overrides = {}) => {
+        const emitExit = (spanInfo, overrides = {}) => {
             const finalDetail = {
                 returnValue: overrides.hasOwnProperty('returnValue')
                     ? overrides.returnValue
@@ -122,8 +153,10 @@ const trace = {
                 file: baseMeta.file,
                 line: baseMeta.line,
                 functionType: baseMeta.functionType || null,
-                traceId: ctx.traceId,
-                depth: depthAtExit,
+                traceId: traceIdAtExit,
+                depth: spanInfo.depth ?? depthAtExit,
+                spanId: spanInfo.id,
+                parentSpanId: spanInfo.parentId,
                 returnValue: finalDetail.returnValue,
                 threw: finalDetail.threw === true,
                 error: finalDetail.error,
@@ -132,22 +165,51 @@ const trace = {
             });
         };
 
-        ctx.depth = Math.max(0, depthAtExit - 1);
+        const emitNow = (overrides = {}) => {
+            const spanStackCopy = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
+            const popped = popSpan(ctx);
+            const spanForExit = popped && popped.id != null ? popped : spanInfoPeek;
+            ctx.depth = Math.max(0, depthAtExit - 1);
+
+            const fn = () => emitExit(spanForExit, overrides);
+            if (!traceIdAtExit) return fn();
+            const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackCopy };
+            return als.run(store, fn);
+        };
 
         if (!baseDetail.threw) {
             const rv = baseDetail.returnValue;
-            if (isThenable(rv) && !forceUnawaited) {
-                if (isMongooseQuery(rv)) {
-                    emitExit({ unawaited: false });
+            const isQuery = isMongooseQuery(rv);
+
+            if (isThenable(rv)) {
+                // For fire-and-forget calls, close the span immediately so later work doesn't inherit it.
+                if (forceUnawaited) {
+                    try {
+                        process.stderr.write(`[trace-debug] unawaited immediate fn=${baseMeta.fn || '(anonymous)'} span=${spanInfoPeek.id ?? 'null'} parent=${spanInfoPeek.parentId ?? 'null'} depth=${spanInfoPeek.depth ?? depthAtExit}\n`);
+                    } catch {}
+                    emitNow({ unawaited: true });
                     return;
                 }
+
+                if (isQuery) {
+                    emitNow({ unawaited: forceUnawaited });
+                    return;
+                }
+
+                // Eagerly pop the span so awaited continuations don't inherit it.
+                const spanStackForExit = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
+                const spanForExit = popSpan(ctx) || spanInfoPeek;
+                ctx.depth = Math.max(0, depthAtExit - 1);
 
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
                     settled = true;
-                    emitExit({ returnValue: value, threw, error });
-                    return value;
+
+                    const fn = () => emitExit(spanForExit, { returnValue: value, threw, error, unawaited: forceUnawaited });
+                    if (!traceIdAtExit) return fn();
+                    const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit.slice() };
+                    return als.run(store, fn);
                 };
 
                 try {
@@ -160,12 +222,17 @@ const trace = {
                 }
                 return;
             }
+
+            if (isQuery) {
+                emitNow({ unawaited: forceUnawaited });
+                return;
+            }
         }
 
         if (DEBUG_UNAWAITED) {
             try { process.stderr.write(`[unawaited] exit ${baseMeta.fn} -> ${forceUnawaited}\n`); } catch {}
         }
-        emitExit({ unawaited: forceUnawaited });
+        emitNow({ unawaited: forceUnawaited });
     }
 };
 global.__trace = trace; // called by injected code
@@ -317,6 +384,34 @@ function markPromiseUnawaited(value) {
     }
 }
 
+const CWD = process.cwd().replace(/\\/g, '/');
+const isNodeModulesPath = (p) => !!p && p.replace(/\\/g, '/').includes('/node_modules/');
+const isAppPath = (p) => !!p && p.replace(/\\/g, '/').startsWith(CWD + '/') && !isNodeModulesPath(p);
+
+function isProbablyAsyncFunction(fn) {
+    if (!fn || typeof fn !== 'function') return false;
+    const ctorName = fn.constructor && fn.constructor.name;
+    if (ctorName === 'AsyncFunction' || ctorName === 'AsyncGeneratorFunction') return true;
+    const tag = fn[Symbol.toStringTag];
+    if (tag === 'AsyncFunction' || tag === 'AsyncGeneratorFunction') return true;
+    return false;
+}
+
+function forkAlsStoreForUnawaited(baseStore) {
+    if (!baseStore) return null;
+    const cloned = { ...baseStore };
+    if (Array.isArray(baseStore.__repro_span_stack)) {
+        cloned.__repro_span_stack = baseStore.__repro_span_stack.slice();
+    }
+    if (Array.isArray(baseStore.__repro_frame_unawaited)) {
+        cloned.__repro_frame_unawaited = baseStore.__repro_frame_unawaited.slice();
+    }
+    if (Array.isArray(baseStore.__repro_pending_unawaited)) {
+        cloned.__repro_pending_unawaited = baseStore.__repro_pending_unawaited.slice();
+    }
+    return cloned;
+}
+
 // ========= Generic call-site shim (used by Babel transform) =========
 // Decides whether to emit a top-level event based on callee origin tags.
 // No hardcoded library names or file paths.
@@ -328,94 +423,116 @@ if (!global.__repro_call) {
                     return fn.apply(thisArg, args);
                 }
 
-                const isApp = fn[SYM_IS_APP] === true;
-                if (isApp) {
-                    const ctx = als.getStore();
-                    let pendingMarker = null;
-                    if (ctx && isUnawaitedCall) {
-                        const queue = ctx.__repro_pending_unawaited || (ctx.__repro_pending_unawaited = []);
-                        pendingMarker = { unawaited: true, id: Symbol('unawaited') };
-                        queue.push(pendingMarker);
+                const currentStore = als.getStore();
+                const sourceFile = fn[SYM_SRC_FILE];
+                let isApp = fn[SYM_IS_APP] === true;
+                if (!isApp) {
+                    const appBySource = isAppPath(sourceFile);
+                    const appByCall = !appBySource && isAppPath(callFile);
+                    if ((appBySource || appByCall) && !isNativeFunction(fn)) {
+                        isApp = true;
+                        try { Object.defineProperty(fn, SYM_IS_APP, { value: true, configurable: true }); } catch {}
                     }
+                }
+                const shouldFork = !!(currentStore && isUnawaitedCall);
+                const runWithStore = (fnToRun) => {
+                    if (shouldFork) {
+                        const forked = forkAlsStoreForUnawaited(currentStore);
+                        return als.run(forked, fnToRun);
+                    }
+                    return fnToRun();
+                };
 
-                    try {
-                        const out = fn.apply(thisArg, args);
-                        if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
-                        return out;
-                    } finally {
-                        if (pendingMarker) {
-                            const store = als.getStore();
-                            const queue = store && store.__repro_pending_unawaited;
-                            if (Array.isArray(queue)) {
-                                const idx = queue.indexOf(pendingMarker);
-                                if (idx !== -1) queue.splice(idx, 1);
+                return runWithStore(() => {
+                    if (isApp) {
+                        const ctx = als.getStore();
+                        let pendingMarker = null;
+                        if (ctx && isUnawaitedCall) {
+                            const queue = ctx.__repro_pending_unawaited || (ctx.__repro_pending_unawaited = []);
+                            pendingMarker = { unawaited: true, id: Symbol('unawaited') };
+                            queue.push(pendingMarker);
+                        }
+
+                        try {
+                            const out = fn.apply(thisArg, args);
+                            if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
+                            return out;
+                        } finally {
+                            if (pendingMarker) {
+                                const store = als.getStore();
+                                const queue = store && store.__repro_pending_unawaited;
+                                if (Array.isArray(queue)) {
+                                    const idx = queue.indexOf(pendingMarker);
+                                    if (idx !== -1) queue.splice(idx, 1);
+                                }
                             }
                         }
                     }
-                }
 
-                const name = (label && label.length) || fn.name
-                    ? (label && label.length ? label : fn.name)
-                    : '(anonymous)';
-                const sourceFile = fn[SYM_SRC_FILE];
-                const meta = {
-                    file: sourceFile || callFile || null,
-                    line: sourceFile ? null : (callLine || null)
-                };
+                    const name = (label && label.length) || fn.name
+                        ? (label && label.length ? label : fn.name)
+                        : '(anonymous)';
+                    const sourceFile = fn[SYM_SRC_FILE];
+                    const meta = {
+                        file: sourceFile || callFile || null,
+                        line: sourceFile ? null : (callLine || null)
+                    };
 
-                trace.enter(name, meta, { args });
-                try {
-                    const out = fn.apply(thisArg, args);
+                    trace.enter(name, meta, { args });
+                    try {
+                        const out = fn.apply(thisArg, args);
 
-                    const isThenableValue = isThenable(out);
-                    const isQuery = isMongooseQuery(out);
+                        const isThenableValue = isThenable(out);
+                        const isQuery = isMongooseQuery(out);
                     const shouldForceExit = !!isUnawaitedCall && isThenableValue;
                     const exitDetailBase = {
                         returnValue: out,
                         args,
                         unawaited: shouldForceExit
-                    };
+                        };
 
-                    if (shouldForceExit) markPromiseUnawaited(out);
+                        if (shouldForceExit) markPromiseUnawaited(out);
 
-                    if (isThenableValue) {
-                        if (isQuery || shouldForceExit) {
-                            trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
-                            return out;
-                        }
+                        if (isThenableValue) {
+                            if (isQuery) {
+                                trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
+                                return out;
+                            }
 
-                        let settled = false;
-                        const finalize = (value, threw, error) => {
-                            if (settled) return value;
-                            settled = true;
+                            let settled = false;
+                            const finalize = (value, threw, error) => {
+                                if (settled) return value;
+                                settled = true;
                             const detail = {
                                 returnValue: value,
                                 args,
                                 threw,
-                                error
+                                error,
+                                unawaited: shouldForceExit
                             };
                             trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
                             return value;
                         };
 
-                        try {
-                            out.then(
-                                value => finalize(value, false, null),
-                                err => finalize(undefined, true, err)
-                            );
-                        } catch (err) {
-                            finalize(undefined, true, err);
+                            try {
+                                out.then(
+                                    value => finalize(value, false, null),
+                                    err => finalize(undefined, true, err)
+                                );
+                            } catch (err) {
+                                finalize(undefined, true, err);
+                            }
+                            return out;
                         }
-                        return out;
-                    }
 
-                    // Non-thenable: close span now
-                    trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
-                    return out;
-                } catch (e) {
-                    trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
-                    throw e;
-                }
+                        // Non-thenable: close span now
+                        trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
+                        return out;
+                    } catch (e) {
+                        trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
+                        throw e;
+                    }
+                });
             } catch {
                 return fn ? fn.apply(thisArg, args) : undefined;
             }
