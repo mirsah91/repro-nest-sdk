@@ -49,6 +49,14 @@ function isMongooseQuery(value) {
     );
 }
 
+function isQueryAlreadyExecuted(q) {
+    try {
+        return !!(q && (q._executionStack || q._executed));
+    } catch {
+        return false;
+    }
+}
+
 function pushSpan(ctx, depth) {
     const stack = ctx.__repro_span_stack || (ctx.__repro_span_stack = []);
     const parent = stack.length ? stack[stack.length - 1] : null;
@@ -183,6 +191,7 @@ const trace = {
         if (!baseDetail.threw) {
             const rv = baseDetail.returnValue;
             const isQuery = isMongooseQuery(rv);
+            const queryExecuted = isQueryAlreadyExecuted(rv);
 
             if (isThenable(rv)) {
                 // Detach span immediately so downstream sync work doesn't inherit it.
@@ -192,8 +201,8 @@ const trace = {
                 const spanForExit = popSpan(ctx) || spanInfoPeek;
                 ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
 
-                // Mongoose queries: never await (would re-exec). Emit best-effort now.
-                if (isQuery) {
+                // Mongoose queries: await only if not already executed; otherwise emit best-effort now.
+                if (isQuery && queryExecuted) {
                     emitNow({ unawaited: forceUnawaited, returnValue: rv }, spanForExit, spanStackForExit);
                     return;
                 }
