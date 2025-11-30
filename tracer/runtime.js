@@ -187,14 +187,16 @@ const trace = {
                     return;
                 }
 
-                // Keep the original store (with span) for promise callbacks, but move the caller onto
-                // a popped clone so downstream synchronous work isn't parented under this frame.
-                const callerStore = forkAlsStoreForUnawaited(ctx) || { ...ctx };
-                const callerSpanStack = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
-                callerStore.__repro_span_stack = callerSpanStack;
-                popSpan(callerStore);
-                callerStore.depth = Math.max(0, depthAtExit - 1);
-                try { als.enterWith(callerStore); } catch {}
+                // If the call was marked unawaited, detach the caller by popping the span for further sync work.
+                let callerSpanStack = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
+                if (forceUnawaited) {
+                    const callerStore = forkAlsStoreForUnawaited(ctx) || { ...ctx };
+                    callerStore.__repro_span_stack = callerSpanStack;
+                    popSpan(callerStore);
+                    callerStore.depth = Math.max(0, depthAtExit - 1);
+                    callerSpanStack = callerStore.__repro_span_stack || callerSpanStack;
+                    try { als.enterWith(callerStore); } catch {}
+                }
 
                 let settled = false;
                 const finalize = (value, threw, error) => {
