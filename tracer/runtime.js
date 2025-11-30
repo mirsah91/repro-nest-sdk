@@ -182,6 +182,11 @@ const trace = {
             const isQuery = isMongooseQuery(rv);
 
             if (isThenable(rv)) {
+                if (isQuery) {
+                    emitNow({ unawaited: forceUnawaited });
+                    return;
+                }
+
                 // For fire-and-forget calls (not queries), close immediately.
                 if (forceUnawaited && !isQuery) {
                     emitNow({ unawaited: true, returnValue: rv });
