@@ -1249,6 +1249,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let preferredAppTrace: EndpointTraceInfo | null = null;
             let firstAppTrace: EndpointTraceInfo | null = null;
             let unsubscribe: undefined | (() => void);
+            const debugFns = new Set(['globalResponseHandler', 'sendEmails', 'joinObjectValues']);
 
             try {
                 if (__TRACER__?.tracer?.on) {
@@ -1300,7 +1301,14 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             };
 
                             if (shouldDropTraceEvent(candidate)) {
+                                if (debugFns.has(candidate.fn || '')) {
+                                    try { process.stderr.write(`[trace-debug] dropped fn=${candidate.fn} file=${candidate.file} depth=${candidate.depth ?? ''}\n`); } catch {}
+                                }
                                 return;
+                            }
+
+                            if (debugFns.has(evt.fn || '')) {
+                                try { process.stderr.write(`[trace-debug] evt ${evt.type} fn=${evt.fn} span=${evt.spanId} parent=${evt.parentSpanId} depth=${evt.depth}\n`); } catch {}
                             }
 
                             if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
@@ -1325,6 +1333,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             } catch { /* never break user code */ }
 
             res.on('finish', () => {
+                const finishedAt = Date.now();
                 if (capturedBody === undefined && chunks.length) {
                     const buf = Buffer.isBuffer(chunks[0])
                         ? Buffer.concat(chunks.map(c => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))))
@@ -1364,6 +1373,17 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                     if (requestQuery !== undefined) requestPayload.query = requestQuery;
                     requestPayload.entryPoint = chosenEndpoint;
 
+                    try {
+                        const sample = balancedEvents.slice(0, 5).map(ev => ({
+                            type: ev.type,
+                            fn: ev.fn,
+                            spanId: ev.spanId,
+                            parentSpanId: ev.parentSpanId,
+                            depth: ev.depth
+                        }));
+                        process.stderr.write(`[trace-debug] flush events=${balancedEvents.length} batches=${traceBatches.length} entry=${chosenEndpoint.fn || '(none)'} sample=${JSON.stringify(sample)}\n`);
+                    } catch {}
+
                     post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
                         entries: [{
                             actionId: aid,
@@ -1396,6 +1416,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 
                 const scheduleFlush = () => {
                     try { unsubscribe && unsubscribe(); } catch {}
+                    try { process.stderr.write(`[trace-debug] scheduleFlush after ${Date.now() - finishedAt}ms events=${events.length}\n`); } catch {}
                     flushPayload();
                 };
 

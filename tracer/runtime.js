@@ -184,6 +184,9 @@ const trace = {
             if (isThenable(rv)) {
                 // For fire-and-forget calls, close the span immediately so later work doesn't inherit it.
                 if (forceUnawaited) {
+                    try {
+                        process.stderr.write(`[trace-debug] unawaited immediate fn=${baseMeta.fn || '(anonymous)'} span=${spanInfoPeek.id ?? 'null'} parent=${spanInfoPeek.parentId ?? 'null'} depth=${spanInfoPeek.depth ?? depthAtExit}\n`);
+                    } catch {}
                     emitNow({ unawaited: true });
                     return;
                 }
@@ -193,21 +196,19 @@ const trace = {
                     return;
                 }
 
+                // Eagerly pop the span so awaited continuations don't inherit it.
+                const spanStackForExit = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
+                const spanForExit = popSpan(ctx) || spanInfoPeek;
+                ctx.depth = Math.max(0, depthAtExit - 1);
+
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
                     settled = true;
 
-                    const spanStackForExit = Array.isArray(ctx.__repro_span_stack)
-                        ? ctx.__repro_span_stack.slice()
-                        : Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
-                    const popped = popSpan(ctx);
-                    const spanForExit = popped && popped.id != null ? popped : spanInfoPeek;
-                    ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
-
                     const fn = () => emitExit(spanForExit, { returnValue: value, threw, error, unawaited: forceUnawaited });
                     if (!traceIdAtExit) return fn();
-                    const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit };
+                    const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit.slice() };
                     return als.run(store, fn);
                 };
 
