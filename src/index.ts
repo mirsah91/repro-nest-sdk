@@ -1250,6 +1250,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let firstAppTrace: EndpointTraceInfo | null = null;
             let unsubscribe: undefined | (() => void);
             const debugFns = new Set(['globalResponseHandler', 'sendEmails', 'joinObjectValues']);
+            const spanInfo = new Map<string | number, { fn?: string; file?: string | null; depth?: number }>();
 
             try {
                 if (__TRACER__?.tracer?.on) {
@@ -1290,6 +1291,12 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 evt.unawaited = ev.unawaited === true;
                             }
 
+                            if (evt.type === 'enter' && evt.spanId != null) {
+                                spanInfo.set(evt.spanId, { fn: evt.fn, file: evt.file ?? null, depth: evt.depth });
+                            } else if (evt.type === 'exit' && evt.spanId != null && !spanInfo.has(evt.spanId)) {
+                                spanInfo.set(evt.spanId, { fn: evt.fn, file: evt.file ?? null, depth: evt.depth });
+                            }
+
                             const candidate: TraceEventForFilter = {
                                 type: evt.type,
                                 eventType: evt.type,
@@ -1308,7 +1315,14 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             }
 
                             if (debugFns.has(evt.fn || '')) {
-                                try { process.stderr.write(`[trace-debug] evt ${evt.type} fn=${evt.fn} span=${evt.spanId} parent=${evt.parentSpanId} depth=${evt.depth}\n`); } catch {}
+                                const parentMeta = evt.parentSpanId != null ? spanInfo.get(evt.parentSpanId) : undefined;
+                                try {
+                                    process.stderr.write(
+                                        `[trace-debug] evt ${evt.type} fn=${evt.fn} span=${evt.spanId} parent=${evt.parentSpanId}` +
+                                        (parentMeta ? ` parentFn=${parentMeta.fn}` : ' parentFn=?') +
+                                        ` depth=${evt.depth}\n`
+                                    );
+                                } catch {}
                             }
 
                             if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
