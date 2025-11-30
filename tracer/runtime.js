@@ -182,11 +182,8 @@ const trace = {
             const isQuery = isMongooseQuery(rv);
 
             if (isThenable(rv)) {
-                // For fire-and-forget calls, close the span immediately so later work doesn't inherit it.
-                if (forceUnawaited) {
-                    try {
-                        process.stderr.write(`[trace-debug] unawaited immediate fn=${baseMeta.fn || '(anonymous)'} span=${spanInfoPeek.id ?? 'null'} parent=${spanInfoPeek.parentId ?? 'null'} depth=${spanInfoPeek.depth ?? depthAtExit}\n`);
-                    } catch {}
+                // For fire-and-forget calls (not queries), close immediately.
+                if (forceUnawaited && !isQuery) {
                     emitNow({ unawaited: true, returnValue: rv });
                     return;
                 }
@@ -224,10 +221,6 @@ const trace = {
                 emitNow({ unawaited: forceUnawaited });
                 return;
             }
-        }
-
-        if (DEBUG_UNAWAITED) {
-            try { process.stderr.write(`[unawaited] exit ${baseMeta.fn} -> ${forceUnawaited}\n`); } catch {}
         }
         emitNow({ unawaited: forceUnawaited });
     }
