@@ -182,20 +182,15 @@ const trace = {
             const isQuery = isMongooseQuery(rv);
 
             if (isThenable(rv)) {
-                if (isQuery) {
-                    emitNow({ unawaited: forceUnawaited });
+                // For fire-and-forget calls, close the span immediately so later work doesn't inherit it.
+                if (forceUnawaited) {
+                    emitNow({ unawaited: true });
                     return;
                 }
 
-                // If the call was marked unawaited, detach the caller by popping the span for further sync work.
-                let callerSpanStack = Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
-                if (forceUnawaited) {
-                    const callerStore = forkAlsStoreForUnawaited(ctx) || { ...ctx };
-                    callerStore.__repro_span_stack = callerSpanStack;
-                    popSpan(callerStore);
-                    callerStore.depth = Math.max(0, depthAtExit - 1);
-                    callerSpanStack = callerStore.__repro_span_stack || callerSpanStack;
-                    try { als.enterWith(callerStore); } catch {}
+                if (isQuery) {
+                    emitNow({ unawaited: forceUnawaited });
+                    return;
                 }
 
                 let settled = false;
@@ -205,7 +200,7 @@ const trace = {
 
                     const spanStackForExit = Array.isArray(ctx.__repro_span_stack)
                         ? ctx.__repro_span_stack.slice()
-                        : callerSpanStack.slice();
+                        : Array.isArray(spanStackRef) ? spanStackRef.slice() : [];
                     const popped = popSpan(ctx);
                     const spanForExit = popped && popped.id != null ? popped : spanInfoPeek;
                     ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
