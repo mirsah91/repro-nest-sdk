@@ -75,6 +75,30 @@ function restoreMongooseIfNeeded() {
     } catch {}
 }
 
+function patchMongooseExecCapture() {
+    try {
+        const Qp: any = (mongoose as any).Query?.prototype;
+        if (!Qp || Qp.__repro_exec_patched) return;
+        const origExec = Qp.exec;
+        if (typeof origExec !== 'function') return;
+        Qp.__repro_exec_patched = true;
+        Qp.exec = function reproPatchedExec(this: any, ...args: any[]) {
+            try { (this as any).__repro_is_query = true; } catch {}
+            const p = origExec.apply(this, args);
+            try {
+                if (p && typeof p.then === 'function') {
+                    this.__repro_result_promise = p;
+                    p.then(
+                        (res: any) => { try { this.__repro_result = res; } catch {} return res; },
+                        (err: any) => err
+                    );
+                }
+            } catch {}
+            return p;
+        };
+    } catch {}
+}
+
 // ====== tiny, safe tracer auto-init (no node_modules patches) ======
 type TracerApi = {
     init?: (opts: any) => void;
@@ -528,6 +552,7 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
         tracerPkg.patchHttp?.();
         applyTraceLogPreference(tracerPkg);
         __TRACER_READY = true;
+        patchMongooseExecCapture();
     } catch {
         __TRACER__ = null; // SDK still works without tracer
     } finally {
@@ -979,6 +1004,10 @@ function sanitizeTraceValue(value: any, depth = 0, seen: WeakSet<object> = new W
     if (mongoId !== null) return mongoId;
 
     if (isMongooseQueryLike(value)) {
+        const captured = (value as any).__repro_result;
+        if (captured !== undefined) {
+            return sanitizeTraceValue(captured, depth + 1, seen);
+        }
         return summarizeMongooseQueryValue(value, depth, seen);
     }
 

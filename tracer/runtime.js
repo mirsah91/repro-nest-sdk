@@ -42,10 +42,14 @@ function isNativeFunction(fn) {
 }
 
 function isMongooseQuery(value) {
+    if (!value) return false;
+    const hasExec = typeof value.exec === 'function';
+    const hasModel = !!value.model;
+    const ctorName = value?.constructor?.name;
+    const marked = value.__repro_is_query === true;
     return (
         isThenable(value) &&
-        typeof value.exec === 'function' &&
-        (value?.constructor?.name === 'Query' || value?.model != null)
+        (hasExec || marked || ctorName === 'Query' || hasModel)
     );
 }
 
@@ -191,7 +195,6 @@ const trace = {
         if (!baseDetail.threw) {
             const rv = baseDetail.returnValue;
             const isQuery = isMongooseQuery(rv);
-            const queryExecuted = isQueryAlreadyExecuted(rv);
 
             if (isThenable(rv)) {
                 // Detach span immediately so downstream sync work doesn't inherit it.
@@ -201,13 +204,32 @@ const trace = {
                 const spanForExit = popSpan(ctx) || spanInfoPeek;
                 ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
 
-                // Mongoose queries: await only if not already executed; otherwise emit best-effort now.
-                if (isQuery && queryExecuted) {
+                if (isQuery) {
+                    const qp = rv && rv.__repro_result_promise;
+                    if (qp && typeof qp.then === 'function') {
+                        let settled = false;
+                        const finalize = (value, threw, error) => {
+                            if (settled) return value;
+                            settled = true;
+                            const fn = () => emitExit(spanForExit, { returnValue: value, threw, error, unawaited: forceUnawaited });
+                            if (!traceIdAtExit) return fn();
+                            const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit.slice() };
+                            return als.run(store, fn);
+                        };
+                        try {
+                            qp.then(
+                                value => finalize(value, false, null),
+                                err => finalize(undefined, true, err)
+                            );
+                        } catch (err) {
+                            finalize(undefined, true, err);
+                        }
+                        return;
+                    }
                     emitNow({ unawaited: forceUnawaited, returnValue: rv }, spanForExit, spanStackForExit);
                     return;
                 }
 
-                // Non-query thenables: capture resolved value; mark unawaited if applicable.
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
