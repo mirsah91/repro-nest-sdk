@@ -61,6 +61,16 @@ function isQueryAlreadyExecuted(q) {
     }
 }
 
+function queueQueryFinalizer(query, fn) {
+    try {
+        const list = query.__repro_query_finalizers || (query.__repro_query_finalizers = []);
+        list.push(fn);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function pushSpan(ctx, depth) {
     const stack = ctx.__repro_span_stack || (ctx.__repro_span_stack = []);
     const parent = stack.length ? stack[stack.length - 1] : null;
@@ -204,32 +214,6 @@ const trace = {
                 const spanForExit = popSpan(ctx) || spanInfoPeek;
                 ctx.depth = Math.max(0, (spanForExit.depth ?? depthAtExit) - 1);
 
-                if (isQuery) {
-                    const qp = rv && rv.__repro_result_promise;
-                    if (qp && typeof qp.then === 'function') {
-                        let settled = false;
-                        const finalize = (value, threw, error) => {
-                            if (settled) return value;
-                            settled = true;
-                            const fn = () => emitExit(spanForExit, { returnValue: value, threw, error, unawaited: forceUnawaited });
-                            if (!traceIdAtExit) return fn();
-                            const store = { traceId: traceIdAtExit, depth: spanForExit.depth ?? depthAtExit, __repro_span_stack: spanStackForExit.slice() };
-                            return als.run(store, fn);
-                        };
-                        try {
-                            qp.then(
-                                value => finalize(value, false, null),
-                                err => finalize(undefined, true, err)
-                            );
-                        } catch (err) {
-                            finalize(undefined, true, err);
-                        }
-                        return;
-                    }
-                    emitNow({ unawaited: forceUnawaited, returnValue: rv }, spanForExit, spanStackForExit);
-                    return;
-                }
-
                 let settled = false;
                 const finalize = (value, threw, error) => {
                     if (settled) return value;
@@ -240,14 +224,34 @@ const trace = {
                     return als.run(store, fn);
                 };
 
-                try {
-                    rv.then(
-                        value => finalize(value, false, null),
-                        err => finalize(undefined, true, err)
-                    );
-                } catch (err) {
-                    finalize(undefined, true, err);
+                const attachToPromise = (promise, allowQueryPromise = true) => {
+                    if (!promise || typeof promise.then !== 'function') return false;
+                    if (!allowQueryPromise && isMongooseQuery(promise)) return false;
+                    try {
+                        promise.then(
+                            value => finalize(value, false, null),
+                            err => finalize(undefined, true, err)
+                        );
+                    } catch (err) {
+                        finalize(undefined, true, err);
+                    }
+                    return true;
+                };
+
+                if (isQuery) {
+                    const qp = rv && rv.__repro_result_promise;
+                    if (attachToPromise(qp, false)) return;
+                    if (Object.prototype.hasOwnProperty.call(rv || {}, '__repro_result')) {
+                        finalize(rv.__repro_result, false, null);
+                        return;
+                    }
+                    if (queueQueryFinalizer(rv, finalize)) return;
+                    emitNow({ unawaited: forceUnawaited, returnValue: rv }, spanForExit, spanStackForExit);
+                    return;
                 }
+
+                if (attachToPromise(rv, true)) return;
+                emitNow({ unawaited: forceUnawaited, returnValue: rv }, spanForExit, spanStackForExit);
                 return;
             }
 

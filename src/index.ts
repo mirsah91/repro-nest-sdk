@@ -75,6 +75,17 @@ function restoreMongooseIfNeeded() {
     } catch {}
 }
 
+function flushQueryFinalizers(query: any, value: any, threw: boolean, error: any) {
+    try {
+        const callbacks = (query as any)?.__repro_query_finalizers;
+        if (!Array.isArray(callbacks) || callbacks.length === 0) return;
+        (query as any).__repro_query_finalizers = [];
+        for (const fn of callbacks) {
+            try { fn(value, threw, error); } catch {}
+        }
+    } catch {}
+}
+
 function patchMongooseExecCapture() {
     try {
         const Qp: any = (mongoose as any).Query?.prototype;
@@ -89,8 +100,15 @@ function patchMongooseExecCapture() {
                 if (p && typeof p.then === 'function') {
                     this.__repro_result_promise = p;
                     p.then(
-                        (res: any) => { try { this.__repro_result = res; } catch {} return res; },
-                        (err: any) => err
+                        (res: any) => {
+                            try { this.__repro_result = res; } catch {}
+                            flushQueryFinalizers(this, res, false, null);
+                            return res;
+                        },
+                        (err: any) => {
+                            flushQueryFinalizers(this, undefined, true, err);
+                            return err;
+                        }
                     );
                 }
             } catch {}
