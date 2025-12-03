@@ -159,7 +159,6 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const n = path.node;
             if (n.__repro_internal) return;
             if (n.__wrapped) return;
-            if (n.__repro_async_forked) return;
 
             if (isAwaiterBody(path)) {
                 // Don't wrap the generator passed to __awaiter/__generator; we still want to instrument its callsites.
@@ -235,7 +234,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const enter = t.expressionStatement(
                 markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
-                    [ t.stringLiteral(name), obj({ file, line, functionType: fnType }), obj({ args: argsId }) ]
+                    [ t.stringLiteral(name), obj({ file, line, functionType: fnType, async: path.node.async === true }), obj({ args: argsId }) ]
                 ))
             );
 
@@ -243,7 +242,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
                     [
-                        obj({ fn: name, file, line, functionType: fnType }),
+                        obj({ fn: name, file, line, functionType: fnType, async: path.node.async === true }),
                         obj({ returnValue: resultId, error: errorId, threw: threwId, args: argsId })
                     ]
                 ))
@@ -284,33 +283,8 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const prologue = [ argsDecl, localsDecl, enter ];
             const wrapped = t.blockStatement([ ...prologue, wrappedTry ]);
 
-            let finalBody = wrapped;
-
-            if (path.node.async) {
-                const wrappedClone = t.cloneNode(wrapped, true);
-                const runner = markInternal(t.arrowFunctionExpression([], wrappedClone, true));
-                const runCall = markInternal(t.callExpression(
-                    t.memberExpression(t.identifier('__trace'), t.identifier('runWithStore')),
-                    [ runner ]
-                ));
-                const guard = markInternal(t.ifStatement(
-                    t.logicalExpression(
-                        '&&',
-                        t.identifier('__trace'),
-                        t.memberExpression(t.identifier('__trace'), t.identifier('runWithStore'))
-                    ),
-                    t.blockStatement([ t.returnStatement(runCall) ])
-                ));
-
-                finalBody = t.blockStatement([
-                    guard,
-                    ...wrapped.body
-                ]);
-                n.__repro_async_forked = true;
-            }
-
             if (path.isFunction() || path.isClassMethod() || path.isObjectMethod()) {
-                bodyPath.replaceWith(finalBody);
+                bodyPath.replaceWith(wrapped);
             }
             n.__wrapped = true;
         }
