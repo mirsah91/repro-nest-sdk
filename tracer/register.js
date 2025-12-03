@@ -38,7 +38,7 @@ const mongoosePath = /node_modules[\\/]mongoose[\\/]/;
 
 require('./index').init({
     instrument: true,
-    mode: process.env.TRACE_MODE || 'v8',
+    mode: process.env.TRACE_MODE || 'trace',
     include: [ projectNoNodeModules, expressPath, mongoosePath ],
     exclude: [
         /[\\/]omnitrace[\\/].*/,            // don't instrument the tracer

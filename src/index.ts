@@ -522,7 +522,7 @@ function defaultTracerInitOpts(): TracerInitOpts {
         instrument: true,
         include,
         exclude,
-        mode: process.env.TRACE_MODE || 'v8',
+        mode: process.env.TRACE_MODE || 'trace',
         samplingMs: 10,
     };
 }

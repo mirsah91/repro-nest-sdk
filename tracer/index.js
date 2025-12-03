@@ -27,7 +27,7 @@ function init(opts = {}) {
             'classProperties','classPrivateProperties','classPrivateMethods',
             'dynamicImport','topLevelAwait','typescript',
         ],
-        mode = process.env.TRACE_MODE || 'v8',
+        mode = process.env.TRACE_MODE || 'trace',
         samplingMs = 10,
         functionLogs,
     } = opts;
