@@ -45,20 +45,9 @@ function isFunctionInstrumented(fn) {
     if (!fn || typeof fn !== 'function') return false;
     const flag = '__repro_instrumented';
     try {
-        if (fn.hasOwnProperty(flag)) return !!fn[flag];
+        if (Object.prototype.hasOwnProperty.call(fn, flag)) return !!fn[flag];
     } catch {}
-    let instrumented = false;
-    try {
-        const src = Function.prototype.toString.call(fn);
-        if (typeof src === 'string') {
-            instrumented = src.includes('__trace.exit') || src.includes('trace.exit');
-        }
-    } catch {
-        instrumented = false;
-    }
-    try { Object.defineProperty(fn, flag, { value: instrumented, configurable: true }); }
-    catch { try { fn[flag] = instrumented; } catch {} }
-    return instrumented;
+    return false;
 }
 
 function isMongooseQuery(value) {
