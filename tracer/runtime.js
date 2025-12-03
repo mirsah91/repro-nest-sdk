@@ -474,7 +474,7 @@ if (!global.__repro_call) {
                 }
                 const instrumented = isFunctionInstrumented(fn);
                 const treatAsApp = instrumented || (isApp && instrumented);
-                const shouldFork = !!(currentStore && isUnawaitedCall);
+                const shouldFork = !!currentStore; // fork every call to isolate span stacks
                 const runWithStore = (fnToRun) => {
                     if (shouldFork) {
                         const forked = forkAlsStoreForUnawaited(currentStore);
