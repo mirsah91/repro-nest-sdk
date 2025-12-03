@@ -437,7 +437,10 @@ function isProbablyAsyncFunction(fn) {
 
 function forkAlsStoreForUnawaited(baseStore) {
     if (!baseStore) return null;
-    const cloned = { ...baseStore };
+    const cloned = {
+        traceId: baseStore.traceId,
+        depth: baseStore.depth,
+    };
     if (Array.isArray(baseStore.__repro_span_stack)) {
         cloned.__repro_span_stack = baseStore.__repro_span_stack.slice();
     }
