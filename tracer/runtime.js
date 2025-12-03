@@ -97,6 +97,7 @@ function popSpan(ctx) {
 const trace = {
     on(fn){ listeners.add(fn); return () => listeners.delete(fn); },
     withTrace(id, fn, depth = 0){ return als.run({ traceId: id, depth }, fn); },
+    runWithStore(fn){ return runWithForkedStore(fn); },
     enter(fn, meta, detail){
         const ctx = als.getStore() || {};
         ctx.depth = (ctx.depth || 0) + 1;
@@ -449,6 +450,14 @@ function forkAlsStoreForUnawaited(baseStore) {
     return cloned;
 }
 
+function runWithForkedStore(fn) {
+    if (typeof fn !== 'function') return undefined;
+    const store = als.getStore();
+    if (!store) return fn();
+    const forked = forkAlsStoreForUnawaited(store);
+    return als.run(forked, fn);
+}
+
 // ========= Generic call-site shim (used by Babel transform) =========
 // Decides whether to emit a top-level event based on callee origin tags.
 // No hardcoded library names or file paths.
@@ -670,6 +679,7 @@ module.exports = {
     startV8,
     printV8,
     patchConsole,
+    runWithStore: runWithForkedStore,
     getCurrentTraceId,
     setFunctionLogsEnabled,
     // export symbols so the require hook can tag function origins
