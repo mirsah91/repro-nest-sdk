@@ -533,9 +533,23 @@ if (!global.__repro_call) {
 
                         if (shouldForceExit) markPromiseUnawaited(out);
 
+                        const exitStore = (() => {
+                            try {
+                                const store = als.getStore();
+                                return store ? forkAlsStoreForUnawaited(store) : null;
+                            } catch {
+                                return null;
+                            }
+                        })();
+                        const runExit = (detail) => {
+                            const runner = () => trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
+                            if (exitStore) return als.run(exitStore, runner);
+                            return runner();
+                        };
+
                         if (isThenableValue) {
                             if (isQuery) {
-                                trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
+                                runExit(exitDetailBase);
                                 return out;
                             }
 
@@ -550,7 +564,7 @@ if (!global.__repro_call) {
                                     error,
                                     unawaited: shouldForceExit
                                 };
-                                trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
+                                runExit(detail);
                                 return value;
                             };
 
@@ -565,7 +579,7 @@ if (!global.__repro_call) {
                             return out;
                         }
 
-                        trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
+                        runExit(exitDetailBase);
                         return out;
                     } catch (e) {
                         trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
