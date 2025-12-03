@@ -99,11 +99,6 @@ const trace = {
     withTrace(id, fn, depth = 0){ return als.run({ traceId: id, depth }, fn); },
     enter(fn, meta, detail){
         const ctx = als.getStore() || {};
-        if (meta?.async) {
-            if (Array.isArray(ctx.__repro_span_stack)) ctx.__repro_span_stack = ctx.__repro_span_stack.slice();
-            if (Array.isArray(ctx.__repro_frame_unawaited)) ctx.__repro_frame_unawaited = ctx.__repro_frame_unawaited.slice();
-            if (Array.isArray(ctx.__repro_pending_unawaited)) ctx.__repro_pending_unawaited = ctx.__repro_pending_unawaited.slice();
-        }
         ctx.depth = (ctx.depth || 0) + 1;
 
         const frameStack = ctx.__repro_frame_unawaited || (ctx.__repro_frame_unawaited = []);
@@ -441,20 +436,15 @@ function isProbablyAsyncFunction(fn) {
 
 function forkAlsStoreForUnawaited(baseStore) {
     if (!baseStore) return null;
-    const cloned = {
+    const parentStack = Array.isArray(baseStore.__repro_span_stack) ? baseStore.__repro_span_stack : [];
+    const parent = parentStack.length ? parentStack[parentStack.length - 1] : null;
+    return {
         traceId: baseStore.traceId,
         depth: baseStore.depth,
+        __repro_span_stack: parent ? [parent] : [],
+        __repro_frame_unawaited: [],
+        __repro_pending_unawaited: []
     };
-    if (Array.isArray(baseStore.__repro_span_stack)) {
-        cloned.__repro_span_stack = baseStore.__repro_span_stack.slice();
-    }
-    if (Array.isArray(baseStore.__repro_frame_unawaited)) {
-        cloned.__repro_frame_unawaited = baseStore.__repro_frame_unawaited.slice();
-    }
-    if (Array.isArray(baseStore.__repro_pending_unawaited)) {
-        cloned.__repro_pending_unawaited = baseStore.__repro_pending_unawaited.slice();
-    }
-    return cloned;
 }
 
 // ========= Generic call-site shim (used by Babel transform) =========

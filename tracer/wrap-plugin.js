@@ -234,7 +234,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const enter = t.expressionStatement(
                 markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
-                    [ t.stringLiteral(name), obj({ file, line, functionType: fnType, async: path.node.async === true }), obj({ args: argsId }) ]
+                    [ t.stringLiteral(name), obj({ file, line, functionType: fnType }), obj({ args: argsId }) ]
                 ))
             );
 
