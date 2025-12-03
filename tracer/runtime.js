@@ -456,8 +456,7 @@ if (!global.__repro_call) {
                 let isApp = fn[SYM_IS_APP] === true;
                 if (!isApp) {
                     const appBySource = isAppPath(sourceFile);
-                    const appByCall = !appBySource && isAppPath(callFile);
-                    if ((appBySource || appByCall) && !isNativeFunction(fn)) {
+                    if (appBySource && !isNativeFunction(fn)) {
                         isApp = true;
                         try { Object.defineProperty(fn, SYM_IS_APP, { value: true, configurable: true }); } catch {}
                     }
