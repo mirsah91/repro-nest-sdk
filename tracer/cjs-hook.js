@@ -20,7 +20,7 @@ function toPosix(file) {
     return String(file || '').replace(/\\/g, '/');
 }
 
-function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
+function tagExports(value, filename, seen = new WeakSet(), depth = 0, instrumented = false) {
     if (value == null) return;
     const ty = typeof value;
     if (ty !== 'object' && ty !== 'function') return;
@@ -37,6 +37,9 @@ function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
             if (value[SYM_IS_APP] !== isApp) {
                 Object.defineProperty(value, SYM_IS_APP, { value: isApp, configurable: true });
             }
+            if (instrumented && value.__repro_instrumented !== true) {
+                Object.defineProperty(value, '__repro_instrumented', { value: true, configurable: true });
+            }
         } catch {}
         const proto = value.prototype;
         if (proto && typeof proto === 'object') {
@@ -44,10 +47,10 @@ function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
                 if (k === 'constructor') continue;
                 const d = Object.getOwnPropertyDescriptor(proto, k);
                 if (!d) continue;
-                if (typeof d.value === 'function') tagExports(d.value, filename, seen, depth + 1);
+                if (typeof d.value === 'function') tagExports(d.value, filename, seen, depth + 1, instrumented);
                 // also tag accessors
-                if (typeof d.get === 'function') tagExports(d.get, filename, seen, depth + 1);
-                if (typeof d.set === 'function') tagExports(d.set, filename, seen, depth + 1);
+                if (typeof d.get === 'function') tagExports(d.get, filename, seen, depth + 1, instrumented);
+                if (typeof d.set === 'function') tagExports(d.set, filename, seen, depth + 1, instrumented);
             }
         }
     }
@@ -57,14 +60,14 @@ function tagExports(value, filename, seen = new WeakSet(), depth = 0) {
             const d = Object.getOwnPropertyDescriptor(value, k);
             if (!d) continue;
 
-            if ('value' in d) tagExports(d.value, filename, seen, depth + 1);
+            if ('value' in d) tagExports(d.value, filename, seen, depth + 1, instrumented);
 
             if (typeof d.get === 'function') {
-                tagExports(d.get, filename, seen, depth + 1);
-                try { tagExports(value[k], filename, seen, depth + 1); } catch {}
+                tagExports(d.get, filename, seen, depth + 1, instrumented);
+                try { tagExports(value[k], filename, seen, depth + 1, instrumented); } catch {}
             }
             if (typeof d.set === 'function') {
-                tagExports(d.set, filename, seen, depth + 1);
+                tagExports(d.set, filename, seen, depth + 1, instrumented);
             }
         }
     }
@@ -89,6 +92,7 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
         let out = code;
         let metaFilename = filename;
         let mapOriginalPosition = null;
+        let wasInstrumented = false;
         try {
             if (shouldHandle(filename) && isAppFile(filename)) {
                 const sourceInfo = getSourceInfo(code, filename);
@@ -117,16 +121,17 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
                     plugins: [
                         [ makeWrap(metaFilename, {
                             mode: 'all',
-                            wrapGettersSetters: false,
-                            skipAnonymous: false,
-                            mapOriginalPosition,
-                        }) ],
-                    ],
-                    compact: false,
-                    comments: true,
-                });
-                out = res?.code || code;
-            }
+                        wrapGettersSetters: false,
+                        skipAnonymous: false,
+                        mapOriginalPosition,
+                    }) ],
+                ],
+                compact: false,
+                comments: true,
+            });
+            out = res?.code || code;
+            wasInstrumented = !!res?.code;
+        }
         } catch {
             out = code; // never break the app if transform fails
         }
@@ -134,7 +139,7 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
         const ret = origCompile.call(this, out, filename);
 
         // Tag exports for origin detection
-        try { tagExports(this.exports, metaFilename); } catch {}
+        try { tagExports(this.exports, metaFilename, new WeakSet(), 0, wasInstrumented); } catch {}
 
         return ret;
     };

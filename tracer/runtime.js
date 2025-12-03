@@ -41,6 +41,26 @@ function isNativeFunction(fn) {
     catch { return false; }
 }
 
+function isFunctionInstrumented(fn) {
+    if (!fn || typeof fn !== 'function') return false;
+    const flag = '__repro_instrumented';
+    try {
+        if (fn.hasOwnProperty(flag)) return !!fn[flag];
+    } catch {}
+    let instrumented = false;
+    try {
+        const src = Function.prototype.toString.call(fn);
+        if (typeof src === 'string') {
+            instrumented = src.includes('__trace.exit') || src.includes('trace.exit');
+        }
+    } catch {
+        instrumented = false;
+    }
+    try { Object.defineProperty(fn, flag, { value: instrumented, configurable: true }); }
+    catch { try { fn[flag] = instrumented; } catch {} }
+    return instrumented;
+}
+
 function isMongooseQuery(value) {
     if (!value) return false;
     const hasExec = typeof value.exec === 'function';
@@ -459,8 +479,12 @@ if (!global.__repro_call) {
                     if (appBySource && !isNativeFunction(fn)) {
                         isApp = true;
                         try { Object.defineProperty(fn, SYM_IS_APP, { value: true, configurable: true }); } catch {}
+                    } else if (!sourceFile && callFile && isAppPath(callFile) && !isNativeFunction(fn)) {
+                        isApp = true;
                     }
                 }
+                const instrumented = isFunctionInstrumented(fn);
+                const treatAsApp = instrumented || (isApp && instrumented);
                 const shouldFork = !!(currentStore && isUnawaitedCall);
                 const runWithStore = (fnToRun) => {
                     if (shouldFork) {
@@ -470,32 +494,32 @@ if (!global.__repro_call) {
                     return fnToRun();
                 };
 
-                return runWithStore(() => {
-                    if (isApp) {
-                        const ctx = als.getStore();
-                        let pendingMarker = null;
-                        if (ctx && isUnawaitedCall) {
-                            const queue = ctx.__repro_pending_unawaited || (ctx.__repro_pending_unawaited = []);
-                            pendingMarker = { unawaited: true, id: Symbol('unawaited') };
-                            queue.push(pendingMarker);
-                        }
+                const invokeApp = () => {
+                    const ctx = als.getStore();
+                    let pendingMarker = null;
+                    if (ctx && isUnawaitedCall) {
+                        const queue = ctx.__repro_pending_unawaited || (ctx.__repro_pending_unawaited = []);
+                        pendingMarker = { unawaited: true, id: Symbol('unawaited') };
+                        queue.push(pendingMarker);
+                    }
 
-                        try {
-                            const out = fn.apply(thisArg, args);
-                            if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
-                            return out;
-                        } finally {
-                            if (pendingMarker) {
-                                const store = als.getStore();
-                                const queue = store && store.__repro_pending_unawaited;
-                                if (Array.isArray(queue)) {
-                                    const idx = queue.indexOf(pendingMarker);
-                                    if (idx !== -1) queue.splice(idx, 1);
-                                }
+                    try {
+                        const out = fn.apply(thisArg, args);
+                        if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
+                        return out;
+                    } finally {
+                        if (pendingMarker) {
+                            const store = als.getStore();
+                            const queue = store && store.__repro_pending_unawaited;
+                            if (Array.isArray(queue)) {
+                                const idx = queue.indexOf(pendingMarker);
+                                if (idx !== -1) queue.splice(idx, 1);
                             }
                         }
                     }
+                };
 
+                const invokeWithTrace = () => {
                     const name = (label && label.length) || fn.name
                         ? (label && label.length ? label : fn.name)
                         : '(anonymous)';
@@ -511,11 +535,11 @@ if (!global.__repro_call) {
 
                         const isThenableValue = isThenable(out);
                         const isQuery = isMongooseQuery(out);
-                    const shouldForceExit = !!isUnawaitedCall && isThenableValue;
-                    const exitDetailBase = {
-                        returnValue: out,
-                        args,
-                        unawaited: shouldForceExit
+                        const shouldForceExit = !!isUnawaitedCall && isThenableValue;
+                        const exitDetailBase = {
+                            returnValue: out,
+                            args,
+                            unawaited: shouldForceExit
                         };
 
                         if (shouldForceExit) markPromiseUnawaited(out);
@@ -530,16 +554,16 @@ if (!global.__repro_call) {
                             const finalize = (value, threw, error) => {
                                 if (settled) return value;
                                 settled = true;
-                            const detail = {
-                                returnValue: value,
-                                args,
-                                threw,
-                                error,
-                                unawaited: shouldForceExit
+                                const detail = {
+                                    returnValue: value,
+                                    args,
+                                    threw,
+                                    error,
+                                    unawaited: shouldForceExit
+                                };
+                                trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
+                                return value;
                             };
-                            trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
-                            return value;
-                        };
 
                             try {
                                 out.then(
@@ -552,13 +576,17 @@ if (!global.__repro_call) {
                             return out;
                         }
 
-                        // Non-thenable: close span now
                         trace.exit({ fn: name, file: meta.file, line: meta.line }, exitDetailBase);
                         return out;
                     } catch (e) {
                         trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
                         throw e;
                     }
+                };
+
+                return runWithStore(() => {
+                    if (treatAsApp) return invokeApp();
+                    return invokeWithTrace();
                 });
             } catch {
                 return fn ? fn.apply(thisArg, args) : undefined;

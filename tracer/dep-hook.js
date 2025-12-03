@@ -40,6 +40,7 @@ function wrapFunction(original, label, file, line) {
 
     // copy a few common props (name/length are non-writable; don’t force)
     try { wrapped[SYM_SKIP_WRAP] = true; } catch {}
+    try { Object.defineProperty(wrapped, '__repro_instrumented', { value: true, configurable: true }); } catch {}
     markWrapped(wrapped);
     return wrapped;
 }
