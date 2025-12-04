@@ -80,9 +80,11 @@ function queueQueryFinalizer(query, fn) {
     }
 }
 
-function pushSpan(ctx, depth) {
+function pushSpan(ctx, depth, explicitParentId = null) {
     const stack = ctx.__repro_span_stack || (ctx.__repro_span_stack = []);
-    const parent = stack.length ? stack[stack.length - 1] : null;
+    const parent = explicitParentId !== null && explicitParentId !== undefined
+        ? { id: explicitParentId, parentId: null }
+        : (stack.length ? stack[stack.length - 1] : null);
     const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null, depth };
     stack.push(span);
     return span;
@@ -103,14 +105,7 @@ const trace = {
             : null;
         const ctx = als.getStore() || {};
 
-        // If an explicit parent is provided, seed a fresh span stack using that parent.
-        if (parentSpanIdOverride !== null && parentSpanIdOverride !== undefined) {
-            ctx.__repro_span_stack = [];
-            ctx.__repro_span_stack.push({ id: parentSpanIdOverride, parentId: null, depth: Math.max(0, (ctx.depth || 0)) });
-            ctx.depth = (ctx.depth || 0) + 1;
-        } else {
-            ctx.depth = (ctx.depth || 0) + 1;
-        }
+        ctx.depth = (ctx.depth || 0) + 1;
 
         const frameStack = ctx.__repro_frame_unawaited || (ctx.__repro_frame_unawaited = []);
         const pendingQueue = ctx.__repro_pending_unawaited;
@@ -124,10 +119,7 @@ const trace = {
         }
         frameStack.push(frameUnawaited);
 
-        const spanStack = ctx.__repro_span_stack || (ctx.__repro_span_stack = []);
-        const parent = spanStack.length ? spanStack[spanStack.length - 1] : null;
-        const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null, depth: ctx.depth };
-        spanStack.push(span);
+        const span = pushSpan(ctx, ctx.depth, parentSpanIdOverride);
 
         emit({
             type: 'enter',
