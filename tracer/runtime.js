@@ -436,12 +436,13 @@ function isProbablyAsyncFunction(fn) {
 
 function forkAlsStoreForUnawaited(baseStore) {
     if (!baseStore) return null;
+    const stack = Array.isArray(baseStore.__repro_span_stack)
+        ? baseStore.__repro_span_stack.filter(s => s && s.__repro_suspended !== true)
+        : [];
     return {
         traceId: baseStore.traceId,
         depth: baseStore.depth,
-        __repro_span_stack: Array.isArray(baseStore.__repro_span_stack)
-            ? baseStore.__repro_span_stack.slice()
-            : [],
+        __repro_span_stack: stack.slice(),
         __repro_frame_unawaited: [],
         __repro_pending_unawaited: []
     };
@@ -539,6 +540,17 @@ if (!global.__repro_call) {
                                 return null;
                             }
                         })();
+                        // Mark the current span as suspended so future forks drop it (prevents sibling async calls from inheriting it).
+                        if (!isUnawaitedCall) {
+                            try {
+                                const store = als.getStore();
+                                const stack = store && store.__repro_span_stack;
+                                if (Array.isArray(stack) && stack.length) {
+                                    const top = stack[stack.length - 1];
+                                    if (top) top.__repro_suspended = true;
+                                }
+                            } catch {}
+                        }
                         const runExit = (detail) => {
                             const runner = () => trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
                             if (exitStore) return als.run(exitStore, runner);
