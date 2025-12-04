@@ -1,5 +1,6 @@
 // register.js
 const escapeRx = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const path = require('node:path');
 const cwd = process.cwd().replace(/\\/g, '/');
 const hook = require('require-in-the-middle');
 const { instrumentExports } = require('./dep-hook');
@@ -32,6 +33,9 @@ try {
 
 // include: your project (excluding its node_modules), plus the specific third-party files we care about
 const projectNoNodeModules = new RegExp('^' + escapeRx(cwd) + '/(?!node_modules/)');
+// also include the SDK’s own source inside node_modules so its internal calls are traced
+const sdkRoot = path.resolve(__dirname, '..').replace(/\\/g, '/');
+const sdkPath = new RegExp('^' + escapeRx(sdkRoot) + '/');
 // match these files via the hook’s per-file logic; include broad paths so the hook sees them:
 const expressPath  = /node_modules[\\/]express[\\/]/;
 const mongoosePath = /node_modules[\\/]mongoose[\\/]/;
@@ -39,8 +43,9 @@ const mongoosePath = /node_modules[\\/]mongoose[\\/]/;
 require('./index').init({
     instrument: true,
     mode: process.env.TRACE_MODE || 'trace',
-    include: [ projectNoNodeModules, expressPath, mongoosePath ],
+    include: [ projectNoNodeModules, sdkPath, expressPath, mongoosePath ],
     exclude: [
         /[\\/]omnitrace[\\/].*/,            // don't instrument the tracer
+        /node_modules[\\/]repro-nest[\\/]tracer[\\/].*/, // avoid instrumenting tracer internals
     ],
 });
