@@ -99,12 +99,7 @@ const trace = {
     withTrace(id, fn, depth = 0){ return als.run({ traceId: id, depth }, fn); },
     enter(fn, meta, detail){
         const ctx = als.getStore() || {};
-        const forcedParent = meta && Object.prototype.hasOwnProperty.call(meta, 'parentSpanId')
-            ? meta.parentSpanId
-            : null;
-        const forcedDepth = meta && Object.prototype.hasOwnProperty.call(meta, 'depth')
-            ? meta.depth
-            : null;
+        ctx.depth = (ctx.depth || 0) + 1;
 
         const frameStack = ctx.__repro_frame_unawaited || (ctx.__repro_frame_unawaited = []);
         const pendingQueue = ctx.__repro_pending_unawaited;
@@ -118,20 +113,7 @@ const trace = {
         }
         frameStack.push(frameUnawaited);
 
-        if (forcedDepth !== null && forcedDepth !== undefined && Number.isFinite(forcedDepth)) {
-            ctx.depth = forcedDepth;
-        } else {
-            ctx.depth = (ctx.depth || 0) + 1;
-        }
-
-        const spanStack = ctx.__repro_span_stack || (ctx.__repro_span_stack = []);
-        const parentFromStack = spanStack.length ? spanStack[spanStack.length - 1] : null;
-        const parentId = forcedParent !== null && forcedParent !== undefined
-            ? forcedParent
-            : (parentFromStack ? parentFromStack.id : null);
-
-        const span = { id: ++SPAN_COUNTER, parentId, depth: ctx.depth };
-        spanStack.push(span);
+        const span = pushSpan(ctx, ctx.depth);
 
         emit({
             type: 'enter',
@@ -492,15 +474,31 @@ if (!global.__repro_call) {
                 const instrumented = isFunctionInstrumented(fn);
                 const treatAsApp = instrumented || (isApp && instrumented);
 
-                // Fork a minimal store per call so siblings don't inherit each other's span stack.
-                const baseStore = currentStore || null;
-                const forkedStore = baseStore ? forkAlsStoreForUnawaited(baseStore) : null;
-                const runWithStore = (fnToRun) => {
-                    if (!forkedStore) return fnToRun();
+                // Capture parent context; derive parent span/depth from current ALS store.
+                const parentStore = currentStore || null;
+                const parentStack = parentStore && Array.isArray(parentStore.__repro_span_stack)
+                    ? parentStore.__repro_span_stack
+                    : [];
+                const parentSpan = parentStack.length ? parentStack[parentStack.length - 1] : null;
+                const baseDepth = parentStore && typeof parentStore.depth === 'number'
+                    ? parentStore.depth
+                    : 0;
+
+                // Build a minimal store for this call and run the call inside it.
+                const makeCallStore = () => ({
+                    traceId: parentStore ? parentStore.traceId : null,
+                    depth: baseDepth,
+                    __repro_span_stack: parentSpan ? [parentSpan] : [],
+                    __repro_frame_unawaited: [],
+                    __repro_pending_unawaited: []
+                });
+
+                const runWithCallStore = (fnToRun) => {
+                    const callStore = makeCallStore();
                     let out;
-                    als.run(forkedStore, () => { out = fnToRun(); });
-                    if (baseStore) {
-                        try { als.enterWith(baseStore); } catch {}
+                    als.run(callStore, () => { out = fnToRun(); });
+                    if (parentStore) {
+                        try { als.enterWith(parentStore); } catch {}
                     }
                     return out;
                 };
@@ -537,13 +535,7 @@ if (!global.__repro_call) {
                     const sourceFile = fn[SYM_SRC_FILE];
                     const meta = {
                         file: sourceFile || callFile || null,
-                        line: sourceFile ? null : (callLine || null),
-                        parentSpanId: (forkedStore && forkedStore.__repro_span_stack && forkedStore.__repro_span_stack.length)
-                            ? forkedStore.__repro_span_stack[forkedStore.__repro_span_stack.length - 1].id
-                            : null,
-                        depth: (forkedStore && typeof forkedStore.depth === 'number')
-                            ? forkedStore.depth + 1
-                            : null
+                        line: sourceFile ? null : (callLine || null)
                     };
 
                     trace.enter(name, meta, { args });
@@ -569,17 +561,7 @@ if (!global.__repro_call) {
                                 return null;
                             }
                         })();
-                        // Mark the current span as suspended so future forks drop it (prevents sibling async calls from inheriting it).
-                        if (!isUnawaitedCall) {
-                            try {
-                                const store = als.getStore();
-                                const stack = store && store.__repro_span_stack;
-                                if (Array.isArray(stack) && stack.length) {
-                                    const top = stack[stack.length - 1];
-                                    if (top) top.__repro_suspended = true;
-                                }
-                            } catch {}
-                        }
+
                         const runExit = (detail) => {
                             const runner = () => trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
                             if (exitStore) return als.run(exitStore, runner);
@@ -626,7 +608,7 @@ if (!global.__repro_call) {
                     }
                 };
 
-                return runWithStore(() => {
+                return runWithCallStore(() => {
                     if (treatAsApp) return invokeApp();
                     return invokeWithTrace();
                 });
