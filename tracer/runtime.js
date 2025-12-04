@@ -470,7 +470,7 @@ if (!global.__repro_call) {
 
                 // If no tracing context is active, bail out quickly to avoid touching app semantics
                 // during module initialization or other untracked code paths.
-                if (!currentStore || !currentStore.traceId) {
+                if (!currentStore) {
                     try {
                         const out = fn.apply(thisArg, args);
                         if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
