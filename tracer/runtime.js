@@ -466,6 +466,18 @@ if (!global.__repro_call) {
                 }
 
                 const currentStore = als.getStore();
+
+                // If no tracing context is active, bail out quickly to avoid touching app semantics
+                // during module initialization or other untracked code paths.
+                if (!currentStore || !currentStore.traceId) {
+                    try {
+                        const out = fn.apply(thisArg, args);
+                        if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
+                        return out;
+                    } catch {
+                        return fn ? fn.apply(thisArg, args) : undefined;
+                    }
+                }
                 const sourceFile = fn[SYM_SRC_FILE];
                 let isApp = fn[SYM_IS_APP] === true;
                 if (!isApp) {
