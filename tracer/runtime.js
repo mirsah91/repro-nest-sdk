@@ -483,21 +483,75 @@ if (!global.__repro_call) {
                 // Capture parent context; derive parent span/depth from current ALS store.
                 const parentStore = currentStore || null;
                 const parentStack = parentStore && Array.isArray(parentStore.__repro_span_stack)
-                    ? parentStore.__repro_span_stack
+                    ? parentStore.__repro_span_stack.slice()
                     : [];
                 const parentSpan = parentStack.length ? parentStack[parentStack.length - 1] : null;
                 const baseDepth = parentStore && typeof parentStore.depth === 'number'
                     ? parentStore.depth
-                    : 0;
+                    : (parentStack.length ? parentStack[parentStack.length - 1].depth || parentStack.length : 0);
+
+                const cloneStore = (store) => {
+                    if (!store) return {
+                        traceId: null,
+                        depth: 0,
+                        __repro_span_stack: [],
+                        __repro_frame_unawaited: [],
+                        __repro_pending_unawaited: []
+                    };
+                    const stack = Array.isArray(store.__repro_span_stack) ? store.__repro_span_stack.slice() : [];
+                    return {
+                        traceId: store.traceId || null,
+                        depth: typeof store.depth === 'number' ? store.depth : (stack.length ? stack[stack.length - 1].depth || stack.length : 0),
+                        __repro_span_stack: stack,
+                        __repro_frame_unawaited: [],
+                        __repro_pending_unawaited: []
+                    };
+                };
 
                 // Build a minimal store for this call and run the call inside it.
                 const makeCallStore = () => ({
                     traceId: parentStore ? parentStore.traceId : null,
                     depth: baseDepth,
-                    __repro_span_stack: parentSpan ? [parentSpan] : [],
+                    __repro_span_stack: parentStack.slice(),
                     __repro_frame_unawaited: [],
                     __repro_pending_unawaited: []
                 });
+
+                const wrapArgWithStore = (arg, baseStoreSnapshot) => {
+                    if (typeof arg !== 'function') return arg;
+                    if (arg[SYM_SKIP_WRAP] || arg.__repro_arg_wrapper) return arg;
+                    const hasContext = baseStoreSnapshot
+                        && (baseStoreSnapshot.traceId != null
+                            || (Array.isArray(baseStoreSnapshot.__repro_span_stack) && baseStoreSnapshot.__repro_span_stack.length));
+                    if (!hasContext) return arg;
+                    const wrapped = function reproWrappedArg() {
+                        const perCallStore = cloneStore(baseStoreSnapshot);
+                        let result;
+                        als.run(perCallStore, () => {
+                            result = arg.apply(this, arguments);
+                        });
+                        return result;
+                    };
+                    try { Object.defineProperty(wrapped, '__repro_arg_wrapper', { value: true }); } catch {}
+                    try { wrapped[SYM_SKIP_WRAP] = true; } catch {}
+                    return wrapped;
+                };
+
+                const wrapArgsWithStore = (argsArr, baseStoreSnapshot) => {
+                    if (!Array.isArray(argsArr)) return argsArr;
+                    return argsArr.map(a => wrapArgWithStore(a, baseStoreSnapshot));
+                };
+
+                const isAsyncLocalContextSetter = (targetFn, targetThis) => {
+                    if (!targetFn) return false;
+                    if (targetFn === trace.withTrace) return true;
+                    if (targetFn === als.run || targetFn === AsyncLocalStorage.prototype.run) return true;
+                    if (targetFn === als.enterWith || targetFn === AsyncLocalStorage.prototype.enterWith) return true;
+                    const name = targetFn.name;
+                    const isALS = targetThis && targetThis instanceof AsyncLocalStorage;
+                    if (isALS && (name === 'run' || name === 'enterWith')) return true;
+                    return false;
+                };
 
                 const runWithCallStore = (fnToRun) => {
                     const callStore = makeCallStore();
@@ -505,14 +559,14 @@ if (!global.__repro_call) {
                         ? callStore.__repro_span_stack[callStore.__repro_span_stack.length - 1].id
                         : null;
                     let out;
-                    als.run(callStore, () => { out = fnToRun(parentSpanId); });
+                    als.run(callStore, () => { out = fnToRun(parentSpanId, callStore); });
                     if (parentStore) {
                         try { als.enterWith(parentStore); } catch {}
                     }
                     return out;
                 };
 
-                const invokeApp = () => {
+                const invokeApp = (callStoreForArgs) => {
                     const ctx = als.getStore();
                     let pendingMarker = null;
                     if (ctx && isUnawaitedCall) {
@@ -522,7 +576,9 @@ if (!global.__repro_call) {
                     }
 
                     try {
-                        const out = fn.apply(thisArg, args);
+                        const shouldWrap = !isAsyncLocalContextSetter(fn, thisArg);
+                        const argsForCall = shouldWrap ? wrapArgsWithStore(args, callStoreForArgs || ctx) : args;
+                        const out = fn.apply(thisArg, argsForCall);
                         if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
                         return out;
                     } finally {
@@ -537,7 +593,7 @@ if (!global.__repro_call) {
                     }
                 };
 
-                const invokeWithTrace = (forcedParentSpanId) => {
+                const invokeWithTrace = (forcedParentSpanId, callStoreForArgs) => {
                     const name = (label && label.length) || fn.name
                         ? (label && label.length ? label : fn.name)
                         : '(anonymous)';
@@ -549,8 +605,13 @@ if (!global.__repro_call) {
                     };
 
                     trace.enter(name, meta, { args });
+                    // After entering, snapshot a clean store that captures the parent + this call’s span,
+                    // so callbacks invoked during the callee run are isolated per invocation.
+                    const snapshotForArgs = cloneStore(als.getStore());
+                    const shouldWrap = !isAsyncLocalContextSetter(fn, thisArg);
+                    const argsForCall = shouldWrap ? wrapArgsWithStore(args, snapshotForArgs) : args;
                     try {
-                        const out = fn.apply(thisArg, args);
+                        const out = fn.apply(thisArg, argsForCall);
 
                         const isThenableValue = isThenable(out);
                         const isQuery = isMongooseQuery(out);
@@ -618,9 +679,9 @@ if (!global.__repro_call) {
                     }
                 };
 
-                return runWithCallStore((forcedParentSpanId) => {
-                    if (treatAsApp) return invokeApp();
-                    return invokeWithTrace(forcedParentSpanId);
+                return runWithCallStore((forcedParentSpanId, callStoreForArgs) => {
+                    if (treatAsApp) return invokeApp(callStoreForArgs);
+                    return invokeWithTrace(forcedParentSpanId, callStoreForArgs);
                 });
             } catch {
                 return fn ? fn.apply(thisArg, args) : undefined;
