@@ -231,10 +231,18 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 t.variableDeclarator(threwId, t.booleanLiteral(false))
             ]);
 
+            const metaObj = obj({
+                fn: name,
+                file,
+                line,
+                functionType: fnType,
+                async: path.node.async === true
+            });
+
             const enter = t.expressionStatement(
                 markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
-                    [ t.stringLiteral(name), obj({ file, line, functionType: fnType }), obj({ args: argsId }) ]
+                    [ t.stringLiteral(name), metaObj, obj({ args: argsId }) ]
                 ))
             );
 
@@ -242,7 +250,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('exit')),
                     [
-                        obj({ fn: name, file, line, functionType: fnType, async: path.node.async === true }),
+                        metaObj,
                         obj({ returnValue: resultId, error: errorId, threw: threwId, args: argsId })
                     ]
                 ))
@@ -283,8 +291,30 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             const prologue = [ argsDecl, localsDecl, enter ];
             const wrapped = t.blockStatement([ ...prologue, wrappedTry ]);
 
+            let finalBody = wrapped;
+
+            if (path.node.async && !n.__repro_async_isolated) {
+                const wrappedClone = t.cloneNode(wrapped, true);
+                const runner = markInternal(t.arrowFunctionExpression([], wrappedClone, true));
+                const runCall = markInternal(t.callExpression(
+                    t.memberExpression(t.identifier('__trace'), t.identifier('runWithParentSpan')),
+                    [ runner ]
+                ));
+                const guard = markInternal(t.ifStatement(
+                    t.logicalExpression(
+                        '&&',
+                        t.identifier('__trace'),
+                        t.memberExpression(t.identifier('__trace'), t.identifier('runWithParentSpan'))
+                    ),
+                    t.blockStatement([ t.returnStatement(runCall) ])
+                ));
+
+                finalBody = t.blockStatement([ guard, ...wrapped.body ]);
+                n.__repro_async_isolated = true;
+            }
+
             if (path.isFunction() || path.isClassMethod() || path.isObjectMethod()) {
-                bodyPath.replaceWith(wrapped);
+                bodyPath.replaceWith(finalBody);
             }
             n.__wrapped = true;
         }
