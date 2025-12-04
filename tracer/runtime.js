@@ -98,8 +98,19 @@ const trace = {
     on(fn){ listeners.add(fn); return () => listeners.delete(fn); },
     withTrace(id, fn, depth = 0){ return als.run({ traceId: id, depth }, fn); },
     enter(fn, meta, detail){
+        const parentSpanIdOverride = meta && Object.prototype.hasOwnProperty.call(meta, 'parentSpanId')
+            ? meta.parentSpanId
+            : null;
         const ctx = als.getStore() || {};
-        ctx.depth = (ctx.depth || 0) + 1;
+
+        // If an explicit parent is provided, seed a fresh span stack using that parent.
+        if (parentSpanIdOverride !== null && parentSpanIdOverride !== undefined) {
+            ctx.__repro_span_stack = [];
+            ctx.__repro_span_stack.push({ id: parentSpanIdOverride, parentId: null, depth: Math.max(0, (ctx.depth || 0)) });
+            ctx.depth = (ctx.depth || 0) + 1;
+        } else {
+            ctx.depth = (ctx.depth || 0) + 1;
+        }
 
         const frameStack = ctx.__repro_frame_unawaited || (ctx.__repro_frame_unawaited = []);
         const pendingQueue = ctx.__repro_pending_unawaited;
@@ -113,7 +124,10 @@ const trace = {
         }
         frameStack.push(frameUnawaited);
 
-        const span = pushSpan(ctx, ctx.depth);
+        const spanStack = ctx.__repro_span_stack || (ctx.__repro_span_stack = []);
+        const parent = spanStack.length ? spanStack[spanStack.length - 1] : null;
+        const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null, depth: ctx.depth };
+        spanStack.push(span);
 
         emit({
             type: 'enter',
@@ -495,8 +509,11 @@ if (!global.__repro_call) {
 
                 const runWithCallStore = (fnToRun) => {
                     const callStore = makeCallStore();
+                    const parentSpanId = callStore.__repro_span_stack.length
+                        ? callStore.__repro_span_stack[callStore.__repro_span_stack.length - 1].id
+                        : null;
                     let out;
-                    als.run(callStore, () => { out = fnToRun(); });
+                    als.run(callStore, () => { out = fnToRun(parentSpanId); });
                     if (parentStore) {
                         try { als.enterWith(parentStore); } catch {}
                     }
@@ -528,14 +545,15 @@ if (!global.__repro_call) {
                     }
                 };
 
-                const invokeWithTrace = () => {
+                const invokeWithTrace = (forcedParentSpanId) => {
                     const name = (label && label.length) || fn.name
                         ? (label && label.length ? label : fn.name)
                         : '(anonymous)';
                     const sourceFile = fn[SYM_SRC_FILE];
                     const meta = {
                         file: sourceFile || callFile || null,
-                        line: sourceFile ? null : (callLine || null)
+                        line: sourceFile ? null : (callLine || null),
+                        parentSpanId: forcedParentSpanId
                     };
 
                     trace.enter(name, meta, { args });
@@ -608,9 +626,9 @@ if (!global.__repro_call) {
                     }
                 };
 
-                return runWithCallStore(() => {
+                return runWithCallStore((forcedParentSpanId) => {
                     if (treatAsApp) return invokeApp();
-                    return invokeWithTrace();
+                    return invokeWithTrace(forcedParentSpanId);
                 });
             } catch {
                 return fn ? fn.apply(thisArg, args) : undefined;
