@@ -5,7 +5,7 @@ const path = require('node:path');
 const babel = require('@babel/core');
 const makeWrap = require('./wrap-plugin');
 const { TraceMap, originalPositionFor } = require('@jridgewell/trace-mapping');
-const { SYM_SRC_FILE, SYM_IS_APP } = require('./runtime');
+const { SYM_SRC_FILE, SYM_IS_APP, SYM_BODY_TRACED } = require('./runtime');
 
 const CWD = process.cwd().replace(/\\/g, '/');
 const escapeRx = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -39,6 +39,9 @@ function tagExports(value, filename, seen = new WeakSet(), depth = 0, instrument
             }
             if (instrumented && value.__repro_instrumented !== true) {
                 Object.defineProperty(value, '__repro_instrumented', { value: true, configurable: true });
+            }
+            if (instrumented && value[SYM_BODY_TRACED] !== true) {
+                Object.defineProperty(value, SYM_BODY_TRACED, { value: true, configurable: true });
             }
         } catch {}
         const proto = value.prototype;

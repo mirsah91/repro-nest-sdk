@@ -284,6 +284,7 @@ global.__trace = trace; // called by injected code
 const SYM_SRC_FILE = Symbol.for('__repro_src_file'); // function's defining file (set by require hook)
 const SYM_IS_APP   = Symbol.for('__repro_is_app');   // boolean: true if function is from app code
 const SYM_SKIP_WRAP= Symbol.for('__repro_skip_wrap'); // guard to avoid wrapping our own helpers
+const SYM_BODY_TRACED = Symbol.for('__repro_body_traced'); // set on functions whose bodies already emit trace enter/exit
 const SYM_UNAWAITED = Symbol.for('__repro_unawaited');
 
 function emit(ev){
@@ -490,7 +491,7 @@ if (!global.__repro_call) {
                     }
                 }
                 const instrumented = isFunctionInstrumented(fn);
-                const treatAsApp = instrumented || (isApp && instrumented);
+                const bodyTraced = !!fn[SYM_BODY_TRACED] || fn.__repro_body_traced === true;
 
                 // Capture parent context; derive parent span/depth from current ALS store.
                 const parentStore = currentStore || null;
@@ -578,7 +579,7 @@ if (!global.__repro_call) {
                     return out;
                 };
 
-                const invokeApp = (callStoreForArgs) => {
+                const invokeWithTrace = (forcedParentSpanId, callStoreForArgs) => {
                     const ctx = als.getStore();
                     let pendingMarker = null;
                     if (ctx && isUnawaitedCall) {
@@ -587,25 +588,6 @@ if (!global.__repro_call) {
                         queue.push(pendingMarker);
                     }
 
-                    try {
-                        const shouldWrap = !isAsyncLocalContextSetter(fn, thisArg);
-                        const argsForCall = shouldWrap ? wrapArgsWithStore(args, callStoreForArgs || ctx) : args;
-                        const out = fn.apply(thisArg, argsForCall);
-                        if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
-                        return out;
-                    } finally {
-                        if (pendingMarker) {
-                            const store = als.getStore();
-                            const queue = store && store.__repro_pending_unawaited;
-                            if (Array.isArray(queue)) {
-                                const idx = queue.indexOf(pendingMarker);
-                                if (idx !== -1) queue.splice(idx, 1);
-                            }
-                        }
-                    }
-                };
-
-                const invokeWithTrace = (forcedParentSpanId, callStoreForArgs) => {
                     const name = (label && label.length) || fn.name
                         ? (label && label.length ? label : fn.name)
                         : '(anonymous)';
@@ -688,11 +670,56 @@ if (!global.__repro_call) {
                     } catch (e) {
                         trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
                         throw e;
+                    } finally {
+                        if (pendingMarker) {
+                            const store = als.getStore();
+                            const queue = store && store.__repro_pending_unawaited;
+                            if (Array.isArray(queue)) {
+                                const idx = queue.indexOf(pendingMarker);
+                                if (idx !== -1) queue.splice(idx, 1);
+                            }
+                        }
                     }
                 };
 
                 return runWithCallStore((forcedParentSpanId, callStoreForArgs) => {
-                    if (treatAsApp) return invokeApp(callStoreForArgs);
+                    if (bodyTraced) {
+                        // Already emits enter/exit inside the function body — keep tracing context stable but skip call-level enter/exit.
+                        const ctx = als.getStore();
+                        let pendingMarker = null;
+                        if (ctx && isUnawaitedCall) {
+                            const queue = ctx.__repro_pending_unawaited || (ctx.__repro_pending_unawaited = []);
+                            pendingMarker = { unawaited: true, id: Symbol('unawaited') };
+                            queue.push(pendingMarker);
+                        }
+                        // For unawaited calls, isolate into a forked store so child spans don't leak into the caller's stack.
+                        const isolatedStore = isUnawaitedCall
+                            ? (forkAlsStoreForUnawaited(callStoreForArgs || ctx) || cloneStore(callStoreForArgs || ctx))
+                            : null;
+                        try {
+                            const shouldWrap = !isAsyncLocalContextSetter(fn, thisArg);
+                            const argsForCall = shouldWrap ? wrapArgsWithStore(args, callStoreForArgs || ctx) : args;
+                            let out;
+                            if (isolatedStore) {
+                                als.run(isolatedStore, () => {
+                                    out = fn.apply(thisArg, argsForCall);
+                                });
+                            } else {
+                                out = fn.apply(thisArg, argsForCall);
+                            }
+                            if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
+                            return out;
+                        } finally {
+                            if (pendingMarker) {
+                                const store = als.getStore();
+                                const queue = store && store.__repro_pending_unawaited;
+                                if (Array.isArray(queue)) {
+                                    const idx = queue.indexOf(pendingMarker);
+                                    if (idx !== -1) queue.splice(idx, 1);
+                                }
+                            }
+                        }
+                    }
                     return invokeWithTrace(forcedParentSpanId, callStoreForArgs);
                 });
             } catch {
@@ -779,5 +806,6 @@ module.exports = {
     // export symbols so the require hook can tag function origins
     SYM_SRC_FILE,
     SYM_IS_APP,
-    SYM_SKIP_WRAP
+    SYM_SKIP_WRAP,
+    SYM_BODY_TRACED
 };

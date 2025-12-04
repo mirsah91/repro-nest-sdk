@@ -231,6 +231,15 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 t.variableDeclarator(threwId, t.booleanLiteral(false))
             ]);
 
+            const fnIdForMark = (path.isFunctionDeclaration() || path.isFunctionExpression()) && n.id && t.isIdentifier(n.id)
+                ? n.id
+                : null;
+            const markBodyTraced = fnIdForMark
+                ? markInternal(t.expressionStatement(
+                    t.assignmentExpression('=', t.memberExpression(t.identifier(fnIdForMark.name), t.identifier('__repro_body_traced')), t.booleanLiteral(true))
+                ))
+                : null;
+
             const enter = t.expressionStatement(
                 markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
@@ -280,7 +289,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 t.blockStatement([ exit ])
             );
 
-            const prologue = [ argsDecl, localsDecl, enter ];
+            const prologue = markBodyTraced ? [ markBodyTraced, argsDecl, localsDecl, enter ] : [ argsDecl, localsDecl, enter ];
             const wrapped = t.blockStatement([ ...prologue, wrappedTry ]);
 
             if (path.isFunction() || path.isClassMethod() || path.isObjectMethod()) {
