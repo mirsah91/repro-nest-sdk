@@ -436,23 +436,15 @@ function isProbablyAsyncFunction(fn) {
 
 function forkAlsStoreForUnawaited(baseStore) {
     if (!baseStore) return null;
-    const parentStack = Array.isArray(baseStore.__repro_span_stack) ? baseStore.__repro_span_stack : [];
-    const parent = parentStack.length ? parentStack[parentStack.length - 1] : null;
     return {
         traceId: baseStore.traceId,
         depth: baseStore.depth,
-        __repro_span_stack: parent ? [parent] : [],
+        __repro_span_stack: Array.isArray(baseStore.__repro_span_stack)
+            ? baseStore.__repro_span_stack.slice()
+            : [],
         __repro_frame_unawaited: [],
         __repro_pending_unawaited: []
     };
-}
-
-function runWithParentSpan(fn) {
-    if (typeof fn !== 'function') return undefined;
-    const store = als.getStore();
-    if (!store) return fn();
-    const forked = forkAlsStoreForUnawaited(store);
-    return als.run(forked, fn);
 }
 
 // ========= Generic call-site shim (used by Babel transform) =========
@@ -676,7 +668,6 @@ module.exports = {
     startV8,
     printV8,
     patchConsole,
-    runWithParentSpan,
     getCurrentTraceId,
     setFunctionLogsEnabled,
     // export symbols so the require hook can tag function origins
