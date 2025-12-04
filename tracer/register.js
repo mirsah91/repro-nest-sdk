@@ -49,3 +49,31 @@ require('./index').init({
         /node_modules[\\/]repro-nest[\\/]tracer[\\/].*/, // avoid instrumenting tracer internals
     ],
 });
+
+// Opportunistically instrument modules that were loaded before the hook was installed.
+// This helps when the SDK register is required after some app modules are already in require.cache.
+try {
+    if (typeof instrumentExports === 'function') {
+        const includeMatchers = [ projectNoNodeModules, sdkPath, expressPath, mongoosePath ];
+        const excludeMatchers = [
+            /[\\/]omnitrace[\\/].*/,
+            /node_modules[\\/]repro-nest[\\/]tracer[\\/].*/,
+        ];
+
+        const shouldHandle = (file) => {
+            const f = String(file || '').replace(/\\/g, '/');
+            if (!f) return false;
+            if (excludeMatchers.some(rx => rx.test(f))) return false;
+            return includeMatchers.some(rx => rx.test(f));
+        };
+
+        Object.keys(require.cache || {}).forEach((filename) => {
+            try {
+                if (!shouldHandle(filename)) return;
+                const cached = require.cache[filename];
+                if (!cached || !cached.exports) return;
+                instrumentExports(cached.exports, filename, path.basename(filename));
+            } catch {}
+        });
+    }
+} catch {}
