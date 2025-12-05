@@ -7,7 +7,6 @@ let EMITTING = false;
 const quietEnv = process.env.TRACE_QUIET === '1';
 // Off by default; set TRACE_DEBUG_UNAWAITED=1 to log unawaited enter/exit debug noise.
 const DEBUG_UNAWAITED = process.env.TRACE_DEBUG_UNAWAITED === '1';
-const DEBUG_TARGET = process.env.TRACE_DEBUG_TARGET === '1';
 const TARGET_FN_PATTERNS = [
     /getTemplate/,
     /buildCommonMailData/,
@@ -16,7 +15,6 @@ const TARGET_FN_PATTERNS = [
     /sendEmail/
 ];
 function matchTargetFn(name) {
-    if (!DEBUG_TARGET) return false;
     if (!name) return false;
     return TARGET_FN_PATTERNS.some(rx => rx.test(name));
 }
