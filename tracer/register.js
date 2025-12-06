@@ -39,37 +39,33 @@ const sdkPath = new RegExp('^' + escapeRx(sdkRoot) + '/');
 // match these files via the hook’s per-file logic; include broad paths so the hook sees them:
 const expressPath  = /node_modules[\\/]express[\\/]/;
 const mongoosePath = /node_modules[\\/]mongoose[\\/]/;
+const includeMatchers = [ projectNoNodeModules, sdkPath, expressPath, mongoosePath ];
+const excludeMatchers = [
+    /[\\/]omnitrace[\\/].*/,            // don't instrument the tracer
+    /node_modules[\\/]repro-nest[\\/]tracer[\\/].*/, // avoid instrumenting tracer internals
+];
+
+function shouldHandleCacheFile(file) {
+    const f = String(file || '').replace(/\\/g, '/');
+    if (!f) return false;
+    if (excludeMatchers.some(rx => rx.test(f))) return false;
+    return includeMatchers.some(rx => rx.test(f));
+}
 
 require('./index').init({
     instrument: true,
     mode: process.env.TRACE_MODE || 'trace',
-    include: [ projectNoNodeModules, sdkPath, expressPath, mongoosePath ],
-    exclude: [
-        /[\\/]omnitrace[\\/].*/,            // don't instrument the tracer
-        /node_modules[\\/]repro-nest[\\/]tracer[\\/].*/, // avoid instrumenting tracer internals
-    ],
+    include: includeMatchers,
+    exclude: excludeMatchers,
 });
 
 // Opportunistically instrument modules that were loaded before the hook was installed.
 // This helps when the SDK register is required after some app modules are already in require.cache.
 try {
     if (typeof instrumentExports === 'function') {
-        const includeMatchers = [ projectNoNodeModules, sdkPath, expressPath, mongoosePath ];
-        const excludeMatchers = [
-            /[\\/]omnitrace[\\/].*/,
-            /node_modules[\\/]repro-nest[\\/]tracer[\\/].*/,
-        ];
-
-        const shouldHandle = (file) => {
-            const f = String(file || '').replace(/\\/g, '/');
-            if (!f) return false;
-            if (excludeMatchers.some(rx => rx.test(f))) return false;
-            return includeMatchers.some(rx => rx.test(f));
-        };
-
         Object.keys(require.cache || {}).forEach((filename) => {
             try {
-                if (!shouldHandle(filename)) return;
+                if (!shouldHandleCacheFile(filename)) return;
                 const cached = require.cache[filename];
                 if (!cached || !cached.exports) return;
                 instrumentExports(cached.exports, filename, path.basename(filename));
