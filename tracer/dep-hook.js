@@ -26,6 +26,43 @@ const SKIP_METHOD_NAMES = new Set([
 function alreadyWrapped(fn) { return !!(fn && fn.__repro_wrapped); }
 function markWrapped(fn) { try { Object.defineProperty(fn, '__repro_wrapped', { value: true }); } catch {} }
 
+// Targeted fallback wrapping by function name (no filename assumptions)
+const TARGET_FN_NAMES = new Set([
+    'getTemplate',
+    'buildCommonMailData',
+    'buildLocationMailData',
+    'buildTimestamps',
+    'parseEmail',
+    'sendEmail'
+]);
+function wrapTargetsByName(container, fileLabel) {
+    if (!container || (typeof container !== 'object' && typeof container !== 'function')) return;
+    const seen = new Set();
+    const tryWrap = (holder) => {
+        if (!holder || (typeof holder !== 'object' && typeof holder !== 'function')) return;
+        for (const k of Object.getOwnPropertyNames(holder)) {
+            if (seen.has(k)) continue;
+            seen.add(k);
+            if (!TARGET_FN_NAMES.has(String(k))) continue;
+            const d = Object.getOwnPropertyDescriptor(holder, k);
+            if (!d || d.get || d.set) continue;
+            if (typeof d.value !== 'function') continue;
+            const v = d.value;
+            if (alreadyWrapped(v)) continue;
+            const wrapped = wrapFunction(v, String(k), fileLabel || '');
+            try {
+                shimmer.wrap(holder, k, () => wrapped);
+                try { process.stderr.write(`[trace-debug] manual target wrap: ${fileLabel || ''}#${k}\n`); } catch {}
+            } catch {
+                try { holder[k] = wrapped; } catch {}
+            }
+        }
+    };
+    tryWrap(container);
+    const proto = Object.getPrototypeOf(container);
+    if (proto && proto !== Object.prototype) tryWrap(proto);
+}
+
 // our call bridge -> uses your global helper, preserves return value identity
 function wrapFunction(original, label, file, line) {
     if (typeof original !== 'function') return original;
@@ -118,13 +155,19 @@ function instrumentExports(exports, filename, moduleName) {
     // Generic: recursively wrap functions on object exports
     try {
         if (typeof exports === 'function') {
-            return wrapFunction(exports, moduleName || path.basename(filename), filename, 0);
+            const wrapped = wrapFunction(exports, moduleName || path.basename(filename), filename, 0);
+            try { wrapObjectMethods(wrapped.prototype, filename); } catch {}
+            wrapTargetsByName(wrapped.prototype || wrapped, filename);
+            return wrapped;
         }
         if (exports && typeof exports === 'object') {
-            return wrapObjectMethods(exports, filename);
+            const wrappedObj = wrapObjectMethods(exports, filename);
+            wrapTargetsByName(wrappedObj, filename);
+            return wrappedObj;
         }
     } catch {}
 
+    wrapTargetsByName(exports, filename);
     return exports;
 }
 
