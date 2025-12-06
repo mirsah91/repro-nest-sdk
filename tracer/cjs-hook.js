@@ -91,13 +91,17 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
 
     // ---- Global hook: intercept *all* compiles, regardless of how .ts was compiled ----
     const origCompile = Module.prototype._compile;
+    const transformedFiles = new Set();
     Module.prototype._compile = function patchedCompile(code, filename) {
         let out = code;
         let metaFilename = filename;
         let mapOriginalPosition = null;
         let wasInstrumented = false;
         try {
-            if (shouldHandle(filename) && isAppFile(filename)) {
+            if (transformedFiles.has(filename)) {
+                // Already transformed once; avoid double-transforming code that may already include __repro_call wrappers.
+                out = code;
+            } else if (shouldHandle(filename) && isAppFile(filename)) {
                 try { process.stderr.write(`[trace-debug] compile: ${filename}\n`); } catch {}
                 const sourceInfo = getSourceInfo(code, filename);
                 if (sourceInfo?.metaFilename) {
@@ -125,17 +129,18 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
                     plugins: [
                         [ makeWrap(metaFilename, {
                             mode: 'all',
-                        wrapGettersSetters: false,
-                        skipAnonymous: false,
-                        mapOriginalPosition,
-                    }) ],
-                ],
-                compact: false,
-                comments: true,
-            });
-            out = res?.code || code;
-            wasInstrumented = !!res?.code;
-        }
+                            wrapGettersSetters: false,
+                            skipAnonymous: false,
+                            mapOriginalPosition,
+                        }) ],
+                    ],
+                    compact: false,
+                    comments: true,
+                });
+                out = res?.code || code;
+                wasInstrumented = !!res?.code;
+                transformedFiles.add(filename);
+            }
         } catch (err) {
             out = code; // never break the app if transform fails
             try { process.stderr.write(`[trace-debug] compile error: ${filename} :: ${err?.message || err}\n`); } catch {}
@@ -145,6 +150,7 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
 
         // Tag exports for origin detection
         try { tagExports(this.exports, metaFilename, new WeakSet(), 0, wasInstrumented); } catch {}
+        try { this.__repro_wrapped = true; } catch {}
 
         return ret;
     };
