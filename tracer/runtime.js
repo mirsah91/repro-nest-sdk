@@ -832,10 +832,46 @@ function getCurrentTraceId() {
     return s && s.traceId || null;
 }
 
+// ---- Promise propagation fallback: ensure continuations run with the captured store ----
+let PROMISE_PATCHED = false;
+function patchPromise() {
+    if (PROMISE_PATCHED) return;
+    PROMISE_PATCHED = true;
+
+    const wrapCb = (cb) => {
+        if (typeof cb !== 'function') return cb;
+        const store = als.getStore();
+        if (!store) return cb;
+        const snapshot = cloneStore(store);
+        const wrapped = function reproPromiseCb() {
+            let res;
+            als.run(snapshot, () => { res = cb.apply(this, arguments); });
+            return res;
+        };
+        try { wrapped[SYM_SKIP_WRAP] = true; } catch {}
+        return wrapped;
+    };
+
+    const origThen = Promise.prototype.then;
+    const origCatch = Promise.prototype.catch;
+    const origFinally = Promise.prototype.finally;
+
+    Promise.prototype.then = function reproThen(onFulfilled, onRejected) {
+        return origThen.call(this, wrapCb(onFulfilled), wrapCb(onRejected));
+    };
+    Promise.prototype.catch = function reproCatch(onRejected) {
+        return origCatch.call(this, wrapCb(onRejected));
+    };
+    Promise.prototype.finally = function reproFinally(onFinally) {
+        return origFinally.call(this, wrapCb(onFinally));
+    };
+}
+
 module.exports = {
     trace,
     patchHttp,
     patchArrayIterators,
+    patchPromise,
     startV8,
     printV8,
     patchConsole,

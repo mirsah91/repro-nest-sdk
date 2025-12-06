@@ -4,6 +4,7 @@ const {
     trace,
     patchHttp,
     patchArrayIterators,
+    patchPromise,
     startV8,
     printV8,
     patchConsole,
@@ -37,6 +38,7 @@ function init(opts = {}) {
     patchHttp();
     patchConsole();
     patchArrayIterators();
+    patchPromise();
 
     if (typeof functionLogs === 'boolean') setFunctionLogsEnabled(functionLogs);
 
