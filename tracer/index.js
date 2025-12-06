@@ -3,6 +3,7 @@
 const {
     trace,
     patchHttp,
+    patchArrayIterators,
     startV8,
     printV8,
     patchConsole,
@@ -35,6 +36,7 @@ function init(opts = {}) {
     // install http ALS context so Express/Nest/Fastify get traceIds without extra code
     patchHttp();
     patchConsole();
+    patchArrayIterators();
 
     if (typeof functionLogs === 'boolean') setFunctionLogsEnabled(functionLogs);
 

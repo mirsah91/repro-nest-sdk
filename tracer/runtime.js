@@ -429,6 +429,28 @@ function markPromiseUnawaited(value) {
     }
 }
 
+function cloneStore(baseStore) {
+    if (!baseStore) {
+        return {
+            traceId: null,
+            depth: 0,
+            __repro_span_stack: [],
+            __repro_frame_unawaited: [],
+            __repro_pending_unawaited: []
+        };
+    }
+    const stack = Array.isArray(baseStore.__repro_span_stack) ? baseStore.__repro_span_stack.slice() : [];
+    return {
+        traceId: baseStore.traceId || null,
+        depth: typeof baseStore.depth === 'number'
+            ? baseStore.depth
+            : (stack.length ? stack[stack.length - 1].depth || stack.length : 0),
+        __repro_span_stack: stack,
+        __repro_frame_unawaited: [],
+        __repro_pending_unawaited: []
+    };
+}
+
 const CWD = process.cwd().replace(/\\/g, '/');
 const isNodeModulesPath = (p) => !!p && p.replace(/\\/g, '/').includes('/node_modules/');
 const isAppPath = (p) => !!p && p.replace(/\\/g, '/').startsWith(CWD + '/') && !isNodeModulesPath(p);
@@ -447,13 +469,9 @@ function forkAlsStoreForUnawaited(baseStore) {
     const stack = Array.isArray(baseStore.__repro_span_stack)
         ? baseStore.__repro_span_stack.filter(s => s && s.__repro_suspended !== true)
         : [];
-    return {
-        traceId: baseStore.traceId,
-        depth: baseStore.depth,
-        __repro_span_stack: stack.slice(),
-        __repro_frame_unawaited: [],
-        __repro_pending_unawaited: []
-    };
+    const cloned = cloneStore(baseStore);
+    cloned.__repro_span_stack = stack.slice();
+    return cloned;
 }
 
 // ========= Generic call-site shim (used by Babel transform) =========
@@ -504,24 +522,6 @@ if (!global.__repro_call) {
                 const baseDepth = parentStore && typeof parentStore.depth === 'number'
                     ? parentStore.depth
                     : (parentStack.length ? parentStack[parentStack.length - 1].depth || parentStack.length : 0);
-
-                const cloneStore = (store) => {
-                    if (!store) return {
-                        traceId: null,
-                        depth: 0,
-                        __repro_span_stack: [],
-                        __repro_frame_unawaited: [],
-                        __repro_pending_unawaited: []
-                    };
-                    const stack = Array.isArray(store.__repro_span_stack) ? store.__repro_span_stack.slice() : [];
-                    return {
-                        traceId: store.traceId || null,
-                        depth: typeof store.depth === 'number' ? store.depth : (stack.length ? stack[stack.length - 1].depth || stack.length : 0),
-                        __repro_span_stack: stack,
-                        __repro_frame_unawaited: [],
-                        __repro_pending_unawaited: []
-                    };
-                };
 
                 // Build a minimal store for this call and run the call inside it.
                 const makeCallStore = () => ({
@@ -753,6 +753,41 @@ function patchHttp(){
     } catch {}
 }
 
+// ---- isolate array iterator callbacks so parallel async branches don't share the same ALS store ----
+let ARRAY_ITER_PATCHED = false;
+function patchArrayIterators() {
+    if (ARRAY_ITER_PATCHED) return;
+    ARRAY_ITER_PATCHED = true;
+
+    const methods = ['map', 'forEach', 'filter', 'flatMap', 'reduce'];
+    for (const name of methods) {
+        const orig = Array.prototype[name];
+        if (typeof orig !== 'function') continue;
+
+        Object.defineProperty(Array.prototype, name, {
+            configurable: true,
+            writable: true,
+            value: function reproArrayIter(cb /*, ...rest */) {
+                if (typeof cb !== 'function') return orig.apply(this, arguments);
+                const store = als.getStore();
+                if (!store) return orig.apply(this, arguments);
+
+                const rest = Array.prototype.slice.call(arguments, 1);
+                const wrappedCb = function reproIterCb() {
+                    const perIterStore = cloneStore(store);
+                    let res;
+                    als.run(perIterStore, () => {
+                        res = cb.apply(this, arguments);
+                    });
+                    return res;
+                };
+
+                return orig.apply(this, [wrappedCb, ...rest]);
+            }
+        });
+    }
+}
+
 // ---- optional V8 sampling summary on SIGINT ----
 let inspectorSession = null;
 function startV8(samplingMs = 10){
@@ -800,6 +835,7 @@ function getCurrentTraceId() {
 module.exports = {
     trace,
     patchHttp,
+    patchArrayIterators,
     startV8,
     printV8,
     patchConsole,
