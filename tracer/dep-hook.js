@@ -26,43 +26,6 @@ const SKIP_METHOD_NAMES = new Set([
 function alreadyWrapped(fn) { return !!(fn && fn.__repro_wrapped); }
 function markWrapped(fn) { try { Object.defineProperty(fn, '__repro_wrapped', { value: true }); } catch {} }
 
-// Targeted fallback wrapping by function name (no filename assumptions)
-const TARGET_FN_NAMES = new Set([
-    'getTemplate',
-    'buildCommonMailData',
-    'buildLocationMailData',
-    'buildTimestamps',
-    'parseEmail',
-    'sendEmail'
-]);
-function wrapTargetsByName(container, fileLabel) {
-    if (!container || (typeof container !== 'object' && typeof container !== 'function')) return;
-    const seen = new Set();
-    const tryWrap = (holder) => {
-        if (!holder || (typeof holder !== 'object' && typeof holder !== 'function')) return;
-        for (const k of Object.getOwnPropertyNames(holder)) {
-            if (seen.has(k)) continue;
-            seen.add(k);
-            if (!TARGET_FN_NAMES.has(String(k))) continue;
-            const d = Object.getOwnPropertyDescriptor(holder, k);
-            if (!d || d.get || d.set) continue;
-            if (typeof d.value !== 'function') continue;
-            const v = d.value;
-            if (alreadyWrapped(v)) continue;
-            const wrapped = wrapFunction(v, String(k), fileLabel || '');
-            try {
-                shimmer.wrap(holder, k, () => wrapped);
-                try { process.stderr.write(`[trace-debug] manual target wrap: ${fileLabel || ''}#${k}\n`); } catch {}
-            } catch {
-                try { holder[k] = wrapped; } catch {}
-            }
-        }
-    };
-    tryWrap(container);
-    const proto = Object.getPrototypeOf(container);
-    if (proto && proto !== Object.prototype) tryWrap(proto);
-}
-
 // our call bridge -> uses your global helper, preserves return value identity
 function wrapFunction(original, label, file, line) {
     if (typeof original !== 'function') return original;
@@ -83,38 +46,46 @@ function wrapFunction(original, label, file, line) {
 }
 
 function wrapObjectMethods(obj, file) {
-    if (!obj || typeof obj !== 'object') return obj;
+    const seen = new WeakSet();
+    const maxDepth = 4;
 
-    // own props
-    for (const k of Object.getOwnPropertyNames(obj)) {
-        const d = Object.getOwnPropertyDescriptor(obj, k);
-        if (!d) continue;
-        if (d.get || d.set) continue; // never wrap accessors
-        if (SKIP_METHOD_NAMES.has(k)) continue;
+    const visit = (target, depth = 0) => {
+        if (!target || (typeof target !== 'object' && typeof target !== 'function')) return;
+        if (seen.has(target)) return;
+        if (depth > maxDepth) return;
+        seen.add(target);
 
-        if (typeof d.value === 'function') {
-            const v = d.value;
-            if (!alreadyWrapped(v)) {
-                const w = wrapFunction(v, String(k), file, 0);
-                try { shimmer.wrap(obj, k, () => w); } catch {}
+        // own props
+        for (const k of Object.getOwnPropertyNames(target)) {
+            const d = Object.getOwnPropertyDescriptor(target, k);
+            if (!d) continue;
+            if (d.get || d.set) continue; // never wrap accessors
+            if (SKIP_METHOD_NAMES.has(k)) continue;
+
+            if (typeof d.value === 'function') {
+                const v = d.value;
+                if (!alreadyWrapped(v)) {
+                    const w = wrapFunction(v, String(k), file, 0);
+                    try { shimmer.wrap(target, k, () => w); } catch {
+                        try { target[k] = w; } catch {}
+                    }
+                }
+                continue;
+            }
+
+            if (d.value && (typeof d.value === 'object' || typeof d.value === 'function')) {
+                visit(d.value, depth + 1);
             }
         }
-    }
 
-    // class prototype methods (one level)
-    const proto = Object.getPrototypeOf(obj);
-    if (proto && proto !== Object.prototype) {
-        for (const k of Object.getOwnPropertyNames(proto)) {
-            if (k === 'constructor' || SKIP_METHOD_NAMES.has(k)) continue;
-            const d = Object.getOwnPropertyDescriptor(proto, k);
-            if (!d || d.get || d.set) continue;
-            if (typeof d.value === 'function' && !alreadyWrapped(d.value)) {
-                const w = wrapFunction(d.value, String(k), file, 0);
-                try { shimmer.wrap(proto, k, () => w); } catch {}
-            }
+        // class prototype methods (walk depth once)
+        const proto = Object.getPrototypeOf(target);
+        if (proto && proto !== Object.prototype) {
+            visit(proto, depth + 1);
         }
-    }
+    };
 
+    visit(obj, 0);
     return obj;
 }
 
@@ -157,17 +128,14 @@ function instrumentExports(exports, filename, moduleName) {
         if (typeof exports === 'function') {
             const wrapped = wrapFunction(exports, moduleName || path.basename(filename), filename, 0);
             try { wrapObjectMethods(wrapped.prototype, filename); } catch {}
-            wrapTargetsByName(wrapped.prototype || wrapped, filename);
             return wrapped;
         }
         if (exports && typeof exports === 'object') {
             const wrappedObj = wrapObjectMethods(exports, filename);
-            wrapTargetsByName(wrappedObj, filename);
             return wrappedObj;
         }
     } catch {}
 
-    wrapTargetsByName(exports, filename);
     return exports;
 }
 

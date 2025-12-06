@@ -7,34 +7,6 @@ let EMITTING = false;
 const quietEnv = process.env.TRACE_QUIET === '1';
 // Off by default; set TRACE_DEBUG_UNAWAITED=1 to log unawaited enter/exit debug noise.
 const DEBUG_UNAWAITED = process.env.TRACE_DEBUG_UNAWAITED === '1';
-const TARGET_FN_PATTERNS = [
-    /getTemplate/,
-    /buildCommonMailData/,
-    /buildLocationMailData/,
-    /parseEmail/,
-    /sendEmail/
-];
-function matchTargetFn(name) {
-    if (!name) return false;
-    return TARGET_FN_PATTERNS.some(rx => rx.test(name));
-}
-// Debug logging for specific mailer functions when they hit __repro_call.
-const DEBUG_TARGET_METHODS = new Set([
-    'getTemplate',
-    'buildCommonMailData',
-    'buildLocationMailData',
-    'buildTimestamps',
-    'parseEmail',
-    'sendEmail'
-]);
-function debugLogTarget(fnName, hasStore) {
-    if (!fnName) return;
-    if (!DEBUG_TARGET_METHODS.has(fnName)) return;
-    try {
-        const storeStatus = hasStore ? 'store' : 'no-store';
-        process.stderr.write(`[trace-debug] __repro_call hit: ${fnName} (${storeStatus})\n`);
-    } catch {}
-}
 
 let functionLogsEnabled = !quietEnv;
 let SPAN_COUNTER = 0;
@@ -497,12 +469,10 @@ if (!global.__repro_call) {
 
                 const currentStore = als.getStore();
                 const dbgName = (label && label.length) || (fn && fn.name) || '(anonymous)';
-                const isTargetFn = matchTargetFn(dbgName);
 
                 // If no tracing context is active, bail out quickly to avoid touching app semantics
                 // during module initialization or other untracked code paths.
                 if (!currentStore) {
-                    if (isTargetFn) debugLogTarget(dbgName, false);
                     try {
                         const out = fn.apply(thisArg, args);
                         if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
@@ -623,9 +593,6 @@ if (!global.__repro_call) {
                     const name = (label && label.length) || fn.name
                         ? (label && label.length ? label : fn.name)
                         : '(anonymous)';
-                    if (isTargetFn) {
-                        debugLogTarget(name, true);
-                    }
                     const sourceFile = fn[SYM_SRC_FILE];
                     const meta = {
                         file: sourceFile || callFile || null,

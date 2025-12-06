@@ -52,6 +52,56 @@ function shouldHandleCacheFile(file) {
     return includeMatchers.some(rx => rx.test(f));
 }
 
+// Force-wrap live instances/prototypes for late-loaded classes/objects.
+function forceWrapLiveTargets() {
+    try {
+        if (typeof instrumentExports !== 'function') return;
+
+        const seen = new WeakSet();
+        const maxDepth = 3;
+        const deepInstrument = (val, filename, depth = 0) => {
+            if (!val || depth > maxDepth) return;
+            const ty = typeof val;
+            if (ty !== 'object' && ty !== 'function') return;
+            if (seen.has(val)) return;
+            seen.add(val);
+            try { instrumentExports(val, filename, path.basename(filename)); } catch {}
+            try {
+                if (ty === 'object') {
+                    for (const k of Object.keys(val)) {
+                        deepInstrument(val[k], filename, depth + 1);
+                    }
+                }
+            } catch {}
+        };
+
+        Object.keys(require.cache || {}).forEach((filename) => {
+            try {
+                if (!shouldHandleCacheFile(filename)) return;
+                const cached = require.cache[filename];
+                if (!cached || !cached.exports) return;
+                const exp = cached.exports;
+
+                // Wrap exports normally
+                instrumentExports(exp, filename, path.basename(filename));
+
+                // If a class/prototype is exported, wrap its prototype too
+                if (typeof exp === 'function' && exp.prototype && typeof exp.prototype === 'object') {
+                    instrumentExports(exp.prototype, filename + '#prototype', path.basename(filename));
+                }
+
+                // If default export is an object instance, wrap its own methods
+                if (exp && typeof exp === 'object') {
+                    instrumentExports(exp, filename + '#instance', path.basename(filename));
+                }
+
+                // Deep instrument nested values to catch pre-created instances.
+                deepInstrument(exp, filename, 0);
+            } catch {}
+        });
+    } catch {}
+}
+
 require('./index').init({
     instrument: true,
     mode: process.env.TRACE_MODE || 'trace',
@@ -71,56 +121,7 @@ try {
                 instrumentExports(cached.exports, filename, path.basename(filename));
             } catch {}
         });
-    }
-} catch {}
-
-// Manual probe: wrap specific mailer-related methods if they were loaded before the hook.
-try {
-    if (typeof instrumentExports === 'function') {
-        const targetNames = new Set([
-            'buildCommonMailData',
-            'buildLocationMailData',
-            'buildTimestamps',
-            'parseEmail',
-            'sendEmail',
-            'getTemplate'
-        ]);
-
-        const wrapTargetMethods = (obj, file) => {
-            if (!obj || typeof obj !== 'object') return;
-            const seen = new Set();
-            const tryWrap = (container) => {
-                if (!container || typeof container !== 'object') return;
-                for (const k of Object.getOwnPropertyNames(container)) {
-                    if (seen.has(k)) continue;
-                    seen.add(k);
-                    const d = Object.getOwnPropertyDescriptor(container, k);
-                    if (!d || d.get || d.set) continue;
-                    if (typeof d.value !== 'function') continue;
-                    if (!targetNames.has(String(k))) continue;
-                    try {
-                        const label = `${file || ''}::${k}`;
-                        container[k] = function wrappedTarget() {
-                            try { process.stderr.write(`[trace-debug] manual wrap -> ${label}\n`); } catch {}
-                            return global.__repro_call
-                                ? global.__repro_call(d.value, this, Array.from(arguments), file || '', 0, k, false)
-                                : d.value.apply(this, arguments);
-                        };
-                    } catch {}
-                }
-            };
-            tryWrap(obj);
-            const proto = Object.getPrototypeOf(obj);
-            if (proto && proto !== Object.prototype) tryWrap(proto);
-        };
-
-        Object.keys(require.cache || {}).forEach((filename) => {
-            try {
-                if (!filename || !filename.includes('mailer')) return;
-                const cached = require.cache[filename];
-                if (!cached || !cached.exports) return;
-                wrapTargetMethods(cached.exports, filename);
-            } catch {}
-        });
+        // Also force-wrap live instances/prototypes after cache pass
+        forceWrapLiveTargets();
     }
 } catch {}
