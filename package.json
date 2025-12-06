@@ -1,6 +1,6 @@
 {
   "name": "repro-nest",
-  "version": "0.0.170",
+  "version": "0.0.171",
   "description": "Repro Nest SDK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
