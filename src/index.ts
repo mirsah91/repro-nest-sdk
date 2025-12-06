@@ -914,12 +914,11 @@ const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
 const TRACE_FLUSH_DELAY_MS = 20;
 // Choose how to order trace events in payloads.
-//  - "chronological" (default): preserve the event timestamp/arrival order to avoid shuffling across async contexts.
-//  - "tree": rebuild a parent/child tree from spanIds for depth visualizations.
+//  - "tree" (default): rebuild a parent/child tree from spanIds for depth visualizations.
+//  - "chronological": preserve the event timestamp/arrival order to avoid shuffling across async contexts.
 const TRACE_ORDER_MODE = (() => {
     const mode = String(process.env.TRACE_ORDER_MODE || '').toLowerCase().trim();
-    if (mode === 'tree') return 'tree';
-    return 'chronological';
+    return mode === 'chronological' ? 'chronological' : 'tree';
 })();
 // Extra grace period after res.finish to catch late fire-and-forget work before unsubscribing.
 const TRACE_LINGER_AFTER_FINISH_MS = (() => {
@@ -1335,17 +1334,12 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let flushed = false;
             let finished = false;
             let idleTimer: NodeJS.Timeout | null = null;
-            let hardStopTimer: NodeJS.Timeout | null = null;
             let flushPayload: null | (() => void) = null;
 
             const clearTimers = () => {
                 if (idleTimer) {
                     try { clearTimeout(idleTimer); } catch {}
                     idleTimer = null;
-                }
-                if (hardStopTimer) {
-                    try { clearTimeout(hardStopTimer); } catch {}
-                    hardStopTimer = null;
                 }
             };
 
@@ -1516,11 +1510,9 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 
                 if (__TRACER_READY) {
                     bumpIdle();
-                    const hardDeadlineMs = Math.max(
-                        0,
-                        Math.max(TRACE_LINGER_AFTER_FINISH_MS, TRACE_IDLE_FLUSH_MS) + TRACE_FLUSH_DELAY_MS,
-                    );
-                    hardStopTimer = setTimeout(doFlush, hardDeadlineMs);
+                    // Only flush once the stream goes idle after finish.
+                    // No hard cap so long-running async can still be captured.
+                    // A future env can add a cap if ever needed.
                 } else {
                     doFlush();
                 }
