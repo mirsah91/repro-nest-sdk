@@ -486,20 +486,15 @@ if (!global.__repro_call) {
                     return fn.apply(thisArg, args);
                 }
 
-                const currentStore = als.getStore();
+                let currentStore = als.getStore();
+                if (!currentStore) {
+                    // No ambient ALS store: start a minimal one so downstream calls still trace.
+                    const bootstrap = cloneStore(null);
+                    try { als.enterWith(bootstrap); } catch {}
+                    currentStore = bootstrap;
+                }
                 const dbgName = (label && label.length) || (fn && fn.name) || '(anonymous)';
 
-                // If no tracing context is active, bail out quickly to avoid touching app semantics
-                // during module initialization or other untracked code paths.
-                if (!currentStore) {
-                    try {
-                        const out = fn.apply(thisArg, args);
-                        if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
-                        return out;
-                    } catch {
-                        return fn ? fn.apply(thisArg, args) : undefined;
-                    }
-                }
                 const sourceFile = fn[SYM_SRC_FILE];
                 let isApp = fn[SYM_IS_APP] === true;
                 if (!isApp) {
