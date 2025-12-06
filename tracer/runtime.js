@@ -18,6 +18,24 @@ function matchTargetFn(name) {
     if (!name) return false;
     return TARGET_FN_PATTERNS.some(rx => rx.test(name));
 }
+// Debug logging for specific mailer functions when they hit __repro_call.
+const DEBUG_TARGET_METHODS = new Set([
+    'getTemplate',
+    'buildCommonMailData',
+    'buildLocationMailData',
+    'buildTimestamps',
+    'parseEmail',
+    'sendEmail'
+]);
+function debugLogTarget(fnName, hasStore) {
+    if (!fnName) return;
+    if (!DEBUG_TARGET_METHODS.has(fnName)) return;
+    try {
+        const storeStatus = hasStore ? 'store' : 'no-store';
+        process.stderr.write(`[trace-debug] __repro_call hit: ${fnName} (${storeStatus})\n`);
+    } catch {}
+}
+
 let functionLogsEnabled = !quietEnv;
 let SPAN_COUNTER = 0;
 
@@ -484,9 +502,7 @@ if (!global.__repro_call) {
                 // If no tracing context is active, bail out quickly to avoid touching app semantics
                 // during module initialization or other untracked code paths.
                 if (!currentStore) {
-                    if (isTargetFn) {
-                        try { process.stderr.write(`[trace-debug] target call (no store): ${dbgName}\n`); } catch {}
-                    }
+                    if (isTargetFn) debugLogTarget(dbgName, false);
                     try {
                         const out = fn.apply(thisArg, args);
                         if (isUnawaitedCall && isThenable(out)) markPromiseUnawaited(out);
@@ -608,7 +624,7 @@ if (!global.__repro_call) {
                         ? (label && label.length ? label : fn.name)
                         : '(anonymous)';
                     if (isTargetFn) {
-                        try { process.stderr.write(`[trace-debug] target call traced: ${name}\n`); } catch {}
+                        debugLogTarget(name, true);
                     }
                     const sourceFile = fn[SYM_SRC_FILE];
                     const meta = {
