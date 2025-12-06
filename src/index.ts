@@ -902,7 +902,17 @@ const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
 const TRACE_FLUSH_DELAY_MS = 20;
 // Extra grace period after res.finish to catch late fire-and-forget work before unsubscribing.
-const TRACE_LINGER_AFTER_FINISH_MS = 250;
+const TRACE_LINGER_AFTER_FINISH_MS = (() => {
+    const env = Number(process.env.TRACE_LINGER_AFTER_FINISH_MS);
+    if (Number.isFinite(env) && env >= 0) return env;
+    return 1000; // default 1s to catch slow async callbacks (e.g., email sends)
+})();
+const TRACE_IDLE_FLUSH_MS = (() => {
+    const env = Number(process.env.TRACE_IDLE_FLUSH_MS);
+    if (Number.isFinite(env) && env > 0) return env;
+    // Keep the listener alive until no new events arrive for this many ms after finish.
+    return 2000;
+})();
 
 function isThenable(value: any): value is PromiseLike<any> {
     return value != null && typeof value === 'object' && typeof (value as any).then === 'function';
@@ -1302,6 +1312,38 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let preferredAppTrace: EndpointTraceInfo | null = null;
             let firstAppTrace: EndpointTraceInfo | null = null;
             let unsubscribe: undefined | (() => void);
+            let flushed = false;
+            let finished = false;
+            let idleTimer: NodeJS.Timeout | null = null;
+            let hardStopTimer: NodeJS.Timeout | null = null;
+            let flushPayload: null | (() => void) = null;
+
+            const clearTimers = () => {
+                if (idleTimer) {
+                    try { clearTimeout(idleTimer); } catch {}
+                    idleTimer = null;
+                }
+                if (hardStopTimer) {
+                    try { clearTimeout(hardStopTimer); } catch {}
+                    hardStopTimer = null;
+                }
+            };
+
+            const doFlush = () => {
+                if (flushed) return;
+                flushed = true;
+                clearTimers();
+                try { unsubscribe && unsubscribe(); } catch {}
+                try { flushPayload?.(); } catch {}
+            };
+
+            const bumpIdle = () => {
+                if (!finished || flushed) return;
+                if (idleTimer) {
+                    try { clearTimeout(idleTimer); } catch {}
+                }
+                idleTimer = setTimeout(doFlush, TRACE_IDLE_FLUSH_MS);
+            };
 
             try {
                 if (__TRACER__?.tracer?.on) {
@@ -1372,12 +1414,14 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             }
 
                             events.push(evt);
+                            bumpIdle();
                         });
                     }
                 }
             } catch { /* never break user code */ }
 
             res.on('finish', () => {
+                finished = true;
                 if (capturedBody === undefined && chunks.length) {
                     const buf = Buffer.isBuffer(chunks[0])
                         ? Buffer.concat(chunks.map(c => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))))
@@ -1385,7 +1429,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
-                const flushPayload = () => {
+                flushPayload = () => {
                     const balancedEvents = reorderTraceEvents(balanceTraceEvents(events.slice()));
                     const summary = summarizeEndpointFromEvents(balancedEvents);
                     const chosenEndpoint = summary.endpointTrace
@@ -1447,15 +1491,15 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                     }
                 };
 
-                const scheduleFlush = () => {
-                    try { unsubscribe && unsubscribe(); } catch {}
-                    flushPayload();
-                };
-
                 if (__TRACER_READY) {
-                    setTimeout(scheduleFlush, TRACE_FLUSH_DELAY_MS + TRACE_LINGER_AFTER_FINISH_MS);
+                    bumpIdle();
+                    const hardDeadlineMs = Math.max(
+                        0,
+                        Math.max(TRACE_LINGER_AFTER_FINISH_MS, TRACE_IDLE_FLUSH_MS) + TRACE_FLUSH_DELAY_MS,
+                    );
+                    hardStopTimer = setTimeout(doFlush, hardDeadlineMs);
                 } else {
-                    scheduleFlush();
+                    doFlush();
                 }
             });
 
