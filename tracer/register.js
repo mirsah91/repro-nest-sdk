@@ -90,9 +90,15 @@ function hasBodyTracing(value, seen = new WeakSet(), depth = 0) {
 
 function reloadUninstrumentedAppModules() {
     const reloaded = new Set();
+    const mainFile = (() => {
+        try { return require.main && require.main.filename; } catch { return null; }
+    })() || process.argv[1] || null;
     Object.keys(require.cache || {}).forEach((filename) => {
         try {
             if (!shouldHandleCacheFile(filename)) return;
+            // Never reload the main entrypoint; doing so can re-run bootstrap code (e.g., Nest listen())
+            // and cause duplicate servers / EADDRINUSE.
+            if (mainFile && filename === mainFile) return;
             if (String(filename).replace(/\\/g,'/').includes('/tracer/')) return;
             // Only reload typical app output locations to avoid double-transforming ad-hoc scripts/tests.
             if (!/[\\/]((dist|build|out)[\\/]|src[\\/])/i.test(filename.replace(/\\/g,'/'))) return;
