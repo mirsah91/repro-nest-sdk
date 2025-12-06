@@ -98,6 +98,7 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
         let wasInstrumented = false;
         try {
             if (shouldHandle(filename) && isAppFile(filename)) {
+                try { process.stderr.write(`[trace-debug] compile: ${filename}\n`); } catch {}
                 const sourceInfo = getSourceInfo(code, filename);
                 if (sourceInfo?.metaFilename) {
                     metaFilename = sourceInfo.metaFilename;
@@ -135,8 +136,9 @@ function installCJS({ include, exclude, parserPlugins } = {}) {
             out = res?.code || code;
             wasInstrumented = !!res?.code;
         }
-        } catch {
+        } catch (err) {
             out = code; // never break the app if transform fails
+            try { process.stderr.write(`[trace-debug] compile error: ${filename} :: ${err?.message || err}\n`); } catch {}
         }
 
         const ret = origCompile.call(this, out, filename);
