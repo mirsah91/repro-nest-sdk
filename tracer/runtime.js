@@ -287,6 +287,7 @@ const SYM_IS_APP   = Symbol.for('__repro_is_app');   // boolean: true if functio
 const SYM_SKIP_WRAP= Symbol.for('__repro_skip_wrap'); // guard to avoid wrapping our own helpers
 const SYM_BODY_TRACED = Symbol.for('__repro_body_traced'); // set on functions whose bodies already emit trace enter/exit
 const SYM_UNAWAITED = Symbol.for('__repro_unawaited');
+const SYM_PROMISE_STORE = Symbol.for('__repro_promise_store');
 
 function emit(ev){
     if (EMITTING) return;
@@ -636,6 +637,13 @@ if (!global.__repro_call) {
                         };
 
                         if (isThenableValue) {
+                            // Attach store so downstream promise callbacks can restore context even if ALS loses it.
+                            try {
+                                if (out && typeof out === 'object') {
+                                    Object.defineProperty(out, SYM_PROMISE_STORE, { value: cloneStore(als.getStore()), configurable: true });
+                                }
+                            } catch {}
+
                             if (isQuery) {
                                 runExit(exitDetailBase);
                                 return out;
@@ -840,9 +848,9 @@ function patchPromise() {
 
     const wrapCb = (cb) => {
         if (typeof cb !== 'function') return cb;
-        const store = als.getStore();
-        if (!store) return cb;
-        const snapshot = cloneStore(store);
+        const activeStore = als.getStore() || this?.[SYM_PROMISE_STORE] || null;
+        if (!activeStore) return cb;
+        const snapshot = cloneStore(activeStore);
         const wrapped = function reproPromiseCb() {
             let res;
             als.run(snapshot, () => { res = cb.apply(this, arguments); });
@@ -857,13 +865,13 @@ function patchPromise() {
     const origFinally = Promise.prototype.finally;
 
     Promise.prototype.then = function reproThen(onFulfilled, onRejected) {
-        return origThen.call(this, wrapCb(onFulfilled), wrapCb(onRejected));
+        return origThen.call(this, wrapCb.call(this, onFulfilled), wrapCb.call(this, onRejected));
     };
     Promise.prototype.catch = function reproCatch(onRejected) {
-        return origCatch.call(this, wrapCb(onRejected));
+        return origCatch.call(this, wrapCb.call(this, onRejected));
     };
     Promise.prototype.finally = function reproFinally(onFinally) {
-        return origFinally.call(this, wrapCb(onFinally));
+        return origFinally.call(this, wrapCb.call(this, onFinally));
     };
 }
 
