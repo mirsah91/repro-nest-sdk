@@ -77,3 +77,54 @@ try {
         });
     }
 } catch {}
+
+// Manual probe: wrap specific mailer-related methods if they were loaded before the hook.
+try {
+    if (typeof instrumentExports === 'function') {
+        const targetNames = new Set([
+            'buildCommonMailData',
+            'buildLocationMailData',
+            'buildTimestamps',
+            'parseEmail',
+            'sendEmail',
+            'getTemplate'
+        ]);
+
+        const wrapTargetMethods = (obj, file) => {
+            if (!obj || typeof obj !== 'object') return;
+            const seen = new Set();
+            const tryWrap = (container) => {
+                if (!container || typeof container !== 'object') return;
+                for (const k of Object.getOwnPropertyNames(container)) {
+                    if (seen.has(k)) continue;
+                    seen.add(k);
+                    const d = Object.getOwnPropertyDescriptor(container, k);
+                    if (!d || d.get || d.set) continue;
+                    if (typeof d.value !== 'function') continue;
+                    if (!targetNames.has(String(k))) continue;
+                    try {
+                        const label = `${file || ''}::${k}`;
+                        container[k] = function wrappedTarget() {
+                            try { process.stderr.write(`[trace-debug] manual wrap -> ${label}\n`); } catch {}
+                            return global.__repro_call
+                                ? global.__repro_call(d.value, this, Array.from(arguments), file || '', 0, k, false)
+                                : d.value.apply(this, arguments);
+                        };
+                    } catch {}
+                }
+            };
+            tryWrap(obj);
+            const proto = Object.getPrototypeOf(obj);
+            if (proto && proto !== Object.prototype) tryWrap(proto);
+        };
+
+        Object.keys(require.cache || {}).forEach((filename) => {
+            try {
+                if (!filename || !filename.includes('mailer')) return;
+                const cached = require.cache[filename];
+                if (!cached || !cached.exports) return;
+                wrapTargetMethods(cached.exports, filename);
+            } catch {}
+        });
+    }
+} catch {}
