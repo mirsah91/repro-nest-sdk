@@ -659,6 +659,18 @@ function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
     return balanced;
 }
 
+function sortTraceEventsChronologically(events: TraceEventRecord[]): TraceEventRecord[] {
+    return events
+        .map((ev, idx) => ({ ev, idx }))
+        .sort((a, b) => {
+            const ta = typeof a.ev.t === 'number' ? a.ev.t : Number.POSITIVE_INFINITY;
+            const tb = typeof b.ev.t === 'number' ? b.ev.t : Number.POSITIVE_INFINITY;
+            if (ta !== tb) return ta - tb;
+            return a.idx - b.idx; // stable fallback
+        })
+        .map(w => w.ev);
+}
+
 function reorderTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
     if (!Array.isArray(events) || !events.length) return events;
 
@@ -901,6 +913,14 @@ const TRACE_VALUE_MAX_ITEMS = 20;
 const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
 const TRACE_FLUSH_DELAY_MS = 20;
+// Choose how to order trace events in payloads.
+//  - "chronological" (default): preserve the event timestamp/arrival order to avoid shuffling across async contexts.
+//  - "tree": rebuild a parent/child tree from spanIds for depth visualizations.
+const TRACE_ORDER_MODE = (() => {
+    const mode = String(process.env.TRACE_ORDER_MODE || '').toLowerCase().trim();
+    if (mode === 'tree') return 'tree';
+    return 'chronological';
+})();
 // Extra grace period after res.finish to catch late fire-and-forget work before unsubscribing.
 const TRACE_LINGER_AFTER_FINISH_MS = (() => {
     const env = Number(process.env.TRACE_LINGER_AFTER_FINISH_MS);
@@ -1430,8 +1450,11 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 }
 
                 flushPayload = () => {
-                    const balancedEvents = reorderTraceEvents(balanceTraceEvents(events.slice()));
-                    const summary = summarizeEndpointFromEvents(balancedEvents);
+                    const balancedEvents = balanceTraceEvents(events.slice());
+                    const orderedEvents = TRACE_ORDER_MODE === 'chronological'
+                        ? sortTraceEventsChronologically(balancedEvents)
+                        : reorderTraceEvents(balancedEvents);
+                    const summary = summarizeEndpointFromEvents(orderedEvents);
                     const chosenEndpoint = summary.endpointTrace
                         ?? summary.preferredAppTrace
                         ?? summary.firstAppTrace
@@ -1439,7 +1462,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                         ?? preferredAppTrace
                         ?? firstAppTrace
                         ?? { fn: null, file: null, line: null, functionType: null };
-                    const traceBatches = chunkArray(balancedEvents, TRACE_BATCH_SIZE);
+                    const traceBatches = chunkArray(orderedEvents, TRACE_BATCH_SIZE);
                     const requestBody = sanitizeRequestSnapshot((req as any).body);
                     const requestParams = sanitizeRequestSnapshot((req as any).params);
                     const requestQuery = sanitizeRequestSnapshot((req as any).query);
