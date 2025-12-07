@@ -607,12 +607,13 @@ function alignedNow(): number {
 function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
     if (!Array.isArray(events) || events.length === 0) return events;
 
-    const makeKey = (ev: TraceEventRecord) =>
-        [ev.fn || '', ev.file || '', String(ev.line ?? ''), ev.functionType || ''].join('|');
+    const makeKey = (ev: TraceEventRecord) => {
+        if (ev.spanId !== undefined && ev.spanId !== null) return `span:${ev.spanId}`;
+        return [ev.fn || '', ev.file || '', String(ev.line ?? ''), ev.functionType || ''].join('|');
+    };
 
-    const seenKeys = new Set<string>();
+    const seenMissingExitKeys = new Set<string>();
     const balanced: TraceEventRecord[] = [];
-    const pendingExits: TraceEventRecord[] = [];
 
     for (let i = 0; i < events.length; i++) {
         const ev = events[i];
@@ -625,7 +626,7 @@ function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
         if (ev.type !== 'enter') continue;
 
         const key = makeKey(ev);
-        if (!key || seenKeys.has(key)) continue;
+        if (!key || seenMissingExitKeys.has(key)) continue;
 
         let hasExit = false;
         for (let j = i + 1; j < events.length; j++) {
@@ -636,29 +637,10 @@ function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
             }
         }
 
-        if (!hasExit) {
-            seenKeys.add(key);
-            pendingExits.push({
-                t: ev.t,
-                type: 'exit',
-                fn: ev.fn,
-                file: ev.file,
-                line: ev.line,
-                functionType: ev.functionType,
-                depth: typeof ev.depth === 'number' ? Math.max(0, ev.depth - 1) : ev.depth,
-                spanId: ev.spanId ?? null,
-                parentSpanId: ev.parentSpanId ?? null,
-                args: ev.args,
-                returnValue: undefined,
-                threw: false,
-                error: undefined,
-                unawaited: true,
-            });
-        }
+        if (!hasExit) seenMissingExitKeys.add(key);
     }
 
-    // Add synthetic exits at the end so we don't prematurely unwind the call stack.
-    return balanced.concat(pendingExits);
+    return balanced;
 }
 
 function sortTraceEventsChronologically(events: TraceEventRecord[]): TraceEventRecord[] {
@@ -961,7 +943,7 @@ const TRACE_ORDER_MODE = (() => {
 const TRACE_LINGER_AFTER_FINISH_MS = (() => {
     const env = Number(process.env.TRACE_LINGER_AFTER_FINISH_MS);
     if (Number.isFinite(env) && env >= 0) return env;
-    return 1000; // default 1s to catch slow async callbacks (e.g., email sends)
+    return 5000; // default 5s to catch slow async callbacks (e.g., email sends)
 })();
 const TRACE_IDLE_FLUSH_MS = (() => {
     const env = Number(process.env.TRACE_IDLE_FLUSH_MS);
@@ -1371,12 +1353,17 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let flushed = false;
             let finished = false;
             let idleTimer: NodeJS.Timeout | null = null;
+            let hardStopTimer: NodeJS.Timeout | null = null;
             let flushPayload: null | (() => void) = null;
 
             const clearTimers = () => {
                 if (idleTimer) {
                     try { clearTimeout(idleTimer); } catch {}
                     idleTimer = null;
+                }
+                if (hardStopTimer) {
+                    try { clearTimeout(hardStopTimer); } catch {}
+                    hardStopTimer = null;
                 }
             };
 
@@ -1547,9 +1534,11 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 
                 if (__TRACER_READY) {
                     bumpIdle();
-                    // Only flush once the stream goes idle after finish.
-                    // No hard cap so long-running async can still be captured.
-                    // A future env can add a cap if ever needed.
+                    const hardDeadlineMs = Math.max(
+                        TRACE_FLUSH_DELAY_MS + TRACE_LINGER_AFTER_FINISH_MS,
+                        TRACE_IDLE_FLUSH_MS + TRACE_FLUSH_DELAY_MS,
+                    );
+                    hardStopTimer = setTimeout(doFlush, hardDeadlineMs);
                 } else {
                     doFlush();
                 }
