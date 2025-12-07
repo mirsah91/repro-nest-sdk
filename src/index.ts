@@ -673,34 +673,37 @@ function sortTraceEventsChronologically(events: TraceEventRecord[]): TraceEventR
         .map(w => w.ev);
 }
 
-function computeDepthsFromOrder(events: TraceEventRecord[]): TraceEventRecord[] {
-    const stack: Array<any> = [];
+function computeDepthsFromParentsChronologically(events: TraceEventRecord[]): TraceEventRecord[] {
+    const depthBySpan = new Map<string, number>();
+
+    const normId = (v: any) => (v === null || v === undefined ? null : String(v));
 
     return events.map(ev => {
         const out = { ...ev };
-        const key = ev.spanId ?? null;
-        const isEnter = ev.type === 'enter';
-        if (isEnter) {
-            out.depth = stack.length + 1;
-            stack.push(key ?? Symbol('no-span'));
-        } else {
-            let idx = -1;
-            if (key !== null) {
-                for (let i = stack.length - 1; i >= 0; i--) {
-                    if (stack[i] === key) {
-                        idx = i;
-                        break;
-                    }
-                }
-            }
-            if (idx >= 0) {
-                out.depth = idx + 1;
-                stack.length = idx; // pop matched frame
-            } else {
-                out.depth = Math.max(1, stack.length || 1);
-                if (stack.length) stack.pop(); // best-effort unwind
-            }
+        const sid = normId(ev.spanId);
+        const pid = normId(ev.parentSpanId);
+
+        if (ev.type === 'enter') {
+            const parentDepth = pid ? depthBySpan.get(pid) ?? 0 : 0;
+            const depth = Math.max(1, parentDepth + 1);
+            out.depth = depth;
+            if (sid) depthBySpan.set(sid, depth);
+            return out;
         }
+
+        if (ev.type === 'exit') {
+            if (sid && depthBySpan.has(sid)) {
+                out.depth = depthBySpan.get(sid);
+            } else if (pid && depthBySpan.has(pid)) {
+                out.depth = Math.max(1, (depthBySpan.get(pid) ?? 0) + 1);
+            } else if (typeof ev.depth === 'number') {
+                out.depth = ev.depth;
+            } else {
+                out.depth = 1;
+            }
+            return out;
+        }
+
         return out;
     });
 }
@@ -948,8 +951,8 @@ const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
 const TRACE_FLUSH_DELAY_MS = 20;
 // Choose how to order trace events in payloads.
-//  - "chronological" (default): preserve event arrival order and recompute depths from that order.
-//  - "tree": rebuild a parent/child tree from spanIds for depth visualizations.
+//  - "chronological" (default): preserve event arrival order and set depths using parentSpanId relationships.
+//  - "tree": rebuild a parent/child tree from spanIds for depth visualizations (can shuffle concurrent spans).
 const TRACE_ORDER_MODE = (() => {
     const mode = String(process.env.TRACE_ORDER_MODE || '').toLowerCase().trim();
     return mode === 'tree' ? 'tree' : 'chronological';
@@ -1481,7 +1484,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                     const balancedEvents = balanceTraceEvents(events.slice());
                     const orderedEvents = TRACE_ORDER_MODE === 'tree'
                         ? reorderTraceEvents(balancedEvents)
-                        : computeDepthsFromOrder(sortTraceEventsChronologically(balancedEvents));
+                        : computeDepthsFromParentsChronologically(sortTraceEventsChronologically(balancedEvents));
                     const summary = summarizeEndpointFromEvents(orderedEvents);
                     const chosenEndpoint = summary.endpointTrace
                         ?? summary.preferredAppTrace
