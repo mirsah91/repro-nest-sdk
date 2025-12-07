@@ -1372,12 +1372,14 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let unsubscribe: undefined | (() => void);
             let flushed = false;
             let finished = false;
+            let finishedAt: number | null = null;
             let idleTimer: NodeJS.Timeout | null = null;
             let hardStopTimer: NodeJS.Timeout | null = null;
             let drainTimer: NodeJS.Timeout | null = null;
             let flushPayload: null | (() => void) = null;
             const activeSpans = new Set<string>();
             let anonymousSpanDepth = 0;
+            const ACTIVE_SPAN_FORCE_FLUSH_MS = 30000; // safety guard against leaks
 
             const clearTimers = () => {
                 if (idleTimer) {
@@ -1407,9 +1409,17 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 
             const doFlush = (force: boolean = false) => {
                 if (flushed) return;
-                if (!force && hasActiveWork()) {
+                const stillActive = hasActiveWork();
+                if (stillActive && !force) {
                     scheduleIdleFlush();
                     return;
+                }
+                if (stillActive && force && finishedAt !== null) {
+                    const waited = Date.now() - finishedAt;
+                    if (waited < ACTIVE_SPAN_FORCE_FLUSH_MS) {
+                        scheduleIdleFlush();
+                        return;
+                    }
                 }
                 flushed = true;
                 clearTimers();
@@ -1531,6 +1541,9 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             const handleDone = () => {
                 if (finished && flushed) return;
                 finished = true;
+                if (finishedAt === null) {
+                    finishedAt = Date.now();
+                }
                 if (capturedBody === undefined && chunks.length) {
                     const buf = Buffer.isBuffer(chunks[0])
                         ? Buffer.concat(chunks.map(c => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))))
@@ -1623,14 +1636,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             TRACE_FLUSH_DELAY_MS + TRACE_LINGER_AFTER_FINISH_MS,
                             TRACE_IDLE_FLUSH_MS + TRACE_FLUSH_DELAY_MS,
                         );
-                        hardStopTimer = setTimeout(() => {
-                            if (hasActiveWork()) {
-                                scheduleIdleFlush();
-                                hardStopTimer = setTimeout(() => doFlush(true), TRACE_LINGER_AFTER_FINISH_MS);
-                                return;
-                            }
-                            doFlush(true);
-                        }, hardDeadlineMs);
+                        hardStopTimer = setTimeout(() => doFlush(true), hardDeadlineMs);
                     } else {
                         doFlush(true);
                     }
