@@ -1376,6 +1376,8 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let hardStopTimer: NodeJS.Timeout | null = null;
             let drainTimer: NodeJS.Timeout | null = null;
             let flushPayload: null | (() => void) = null;
+            const activeSpans = new Set<string>();
+            let anonymousSpanDepth = 0;
 
             const clearTimers = () => {
                 if (idleTimer) {
@@ -1392,8 +1394,23 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 }
             };
 
-            const doFlush = () => {
+            const hasActiveWork = () => activeSpans.size > 0 || anonymousSpanDepth > 0;
+
+            const scheduleIdleFlush = () => {
+                if (!finished || flushed) return;
+                if (hasActiveWork()) return;
+                if (idleTimer) {
+                    try { clearTimeout(idleTimer); } catch {}
+                }
+                idleTimer = setTimeout(() => doFlush(false), TRACE_IDLE_FLUSH_MS);
+            };
+
+            const doFlush = (force: boolean = false) => {
                 if (flushed) return;
+                if (!force && hasActiveWork()) {
+                    scheduleIdleFlush();
+                    return;
+                }
                 flushed = true;
                 clearTimers();
                 try { unsubscribe && unsubscribe(); } catch {}
@@ -1405,7 +1422,13 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 if (idleTimer) {
                     try { clearTimeout(idleTimer); } catch {}
                 }
-                idleTimer = setTimeout(doFlush, TRACE_IDLE_FLUSH_MS);
+                scheduleIdleFlush();
+            };
+
+            const normalizeSpanId = (val: any): string | null => {
+                if (val === null || val === undefined) return null;
+                const str = String(val);
+                return str ? str : null;
             };
 
             try {
@@ -1457,8 +1480,30 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 library: inferLibraryNameFromFile(evt.file),
                             };
 
+                            const spanKey = normalizeSpanId(evt.spanId);
+                            if (evt.type === 'enter') {
+                                if (spanKey) {
+                                    activeSpans.add(spanKey);
+                                } else {
+                                    anonymousSpanDepth = Math.max(0, anonymousSpanDepth + 1);
+                                }
+                            } else if (evt.type === 'exit') {
+                                if (spanKey && activeSpans.has(spanKey)) {
+                                    activeSpans.delete(spanKey);
+                                } else if (!spanKey && anonymousSpanDepth > 0) {
+                                    anonymousSpanDepth = Math.max(0, anonymousSpanDepth - 1);
+                                }
+                            }
+
                             if (shouldDropTraceEvent(candidate)) {
+                                if (finished) {
+                                    scheduleIdleFlush();
+                                }
                                 return;
+                            }
+
+                            if (finished) {
+                                scheduleIdleFlush();
                             }
 
                             if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
@@ -1564,7 +1609,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 endSessionRequest(sid);
 
                 if (SESSION_DRAIN_TIMEOUT_MS > 0) {
-                    drainTimer = setTimeout(doFlush, SESSION_DRAIN_TIMEOUT_MS);
+                    drainTimer = setTimeout(() => doFlush(true), SESSION_DRAIN_TIMEOUT_MS);
                 }
 
                 waitDrain.then(() => {
@@ -1578,12 +1623,19 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             TRACE_FLUSH_DELAY_MS + TRACE_LINGER_AFTER_FINISH_MS,
                             TRACE_IDLE_FLUSH_MS + TRACE_FLUSH_DELAY_MS,
                         );
-                        hardStopTimer = setTimeout(doFlush, hardDeadlineMs);
+                        hardStopTimer = setTimeout(() => {
+                            if (hasActiveWork()) {
+                                scheduleIdleFlush();
+                                hardStopTimer = setTimeout(() => doFlush(true), TRACE_LINGER_AFTER_FINISH_MS);
+                                return;
+                            }
+                            doFlush(true);
+                        }, hardDeadlineMs);
                     } else {
-                        doFlush();
+                        doFlush(true);
                     }
                 }).catch(() => {
-                    doFlush();
+                    doFlush(true);
                 });
             };
 
