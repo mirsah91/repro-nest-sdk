@@ -612,6 +612,7 @@ function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
 
     const seenKeys = new Set<string>();
     const balanced: TraceEventRecord[] = [];
+    const pendingExits: TraceEventRecord[] = [];
 
     for (let i = 0; i < events.length; i++) {
         const ev = events[i];
@@ -637,7 +638,7 @@ function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
 
         if (!hasExit) {
             seenKeys.add(key);
-            balanced.push({
+            pendingExits.push({
                 t: ev.t,
                 type: 'exit',
                 fn: ev.fn,
@@ -656,7 +657,8 @@ function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
         }
     }
 
-    return balanced;
+    // Add synthetic exits at the end so we don't prematurely unwind the call stack.
+    return balanced.concat(pendingExits);
 }
 
 function sortTraceEventsChronologically(events: TraceEventRecord[]): TraceEventRecord[] {
