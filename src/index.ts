@@ -1373,6 +1373,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let flushed = false;
             let finished = false;
             let finishedAt: number | null = null;
+            let lastEventAt: number = Date.now();
             let idleTimer: NodeJS.Timeout | null = null;
             let hardStopTimer: NodeJS.Timeout | null = null;
             let drainTimer: NodeJS.Timeout | null = null;
@@ -1398,26 +1399,34 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 
             const hasActiveWork = () => activeSpans.size > 0 || anonymousSpanDepth > 0;
 
-            const scheduleIdleFlush = () => {
+            const scheduleIdleFlush = (delay: number = TRACE_IDLE_FLUSH_MS) => {
                 if (!finished || flushed) return;
                 if (hasActiveWork()) return;
                 if (idleTimer) {
                     try { clearTimeout(idleTimer); } catch {}
                 }
-                idleTimer = setTimeout(() => doFlush(false), TRACE_IDLE_FLUSH_MS);
+                idleTimer = setTimeout(() => doFlush(false), delay);
             };
 
             const doFlush = (force: boolean = false) => {
                 if (flushed) return;
+                const now = Date.now();
                 const stillActive = hasActiveWork();
+                const quietMs = now - lastEventAt;
+                const waitedFinish = finishedAt === null ? 0 : now - finishedAt;
+
+                // If work is still active and we haven't been quiet long enough, defer.
                 if (stillActive && !force) {
-                    scheduleIdleFlush();
+                    const remaining = Math.max(0, TRACE_LINGER_AFTER_FINISH_MS - quietMs);
+                    scheduleIdleFlush(Math.max(remaining, 10));
                     return;
                 }
-                if (stillActive && force && finishedAt !== null) {
-                    const waited = Date.now() - finishedAt;
-                    if (waited < ACTIVE_SPAN_FORCE_FLUSH_MS) {
-                        scheduleIdleFlush();
+                if (stillActive && force) {
+                    // Allow forced flush after either linger window of silence or max guard.
+                    if (quietMs < TRACE_LINGER_AFTER_FINISH_MS && waitedFinish < ACTIVE_SPAN_FORCE_FLUSH_MS) {
+                        const remainingQuiet = TRACE_LINGER_AFTER_FINISH_MS - quietMs;
+                        const remainingGuard = ACTIVE_SPAN_FORCE_FLUSH_MS - waitedFinish;
+                        scheduleIdleFlush(Math.max(10, Math.min(remainingQuiet, remainingGuard)));
                         return;
                     }
                 }
@@ -1492,12 +1501,14 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 
                             const spanKey = normalizeSpanId(evt.spanId);
                             if (evt.type === 'enter') {
+                                lastEventAt = Date.now();
                                 if (spanKey) {
                                     activeSpans.add(spanKey);
                                 } else {
                                     anonymousSpanDepth = Math.max(0, anonymousSpanDepth + 1);
                                 }
                             } else if (evt.type === 'exit') {
+                                lastEventAt = Date.now();
                                 if (spanKey && activeSpans.has(spanKey)) {
                                     activeSpans.delete(spanKey);
                                 } else if (!spanKey && anonymousSpanDepth > 0) {
