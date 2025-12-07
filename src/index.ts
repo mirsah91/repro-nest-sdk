@@ -604,6 +604,13 @@ function alignedNow(): number {
     return alignTimestamp(Date.now());
 }
 
+let __REQUEST_SEQ = 0;
+function nextRequestId(base: number | string): string {
+    const seq = (++__REQUEST_SEQ).toString(36);
+    const rand = Math.floor(Math.random() * 1e6).toString(36);
+    return `${base}-${seq}${rand}`;
+}
+
 // Track in-flight requests per session so we can delay flushing until a session is drained.
 const sessionInFlight = new Map<string, number>();
 const sessionWaiters = new Map<string, Array<() => void>>();
@@ -1320,7 +1327,8 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
         const requestStartRaw = Date.now();
         const headerTs = readHeaderNumber(req.headers[REQUEST_START_HEADER]);
         const clockSkewMs = headerTs !== null ? headerTs - requestStartRaw : 0;
-        const rid = String(headerTs !== null ? headerTs : requestStartRaw + clockSkewMs);
+        const requestEpochMs = headerTs !== null ? headerTs : requestStartRaw + clockSkewMs;
+        const rid = nextRequestId(requestEpochMs);
         const t0 = requestStartRaw;
         const url = (req as any).originalUrl || req.url || '/';
         const path = url; // back-compat
