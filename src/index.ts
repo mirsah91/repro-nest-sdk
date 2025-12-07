@@ -671,6 +671,38 @@ function sortTraceEventsChronologically(events: TraceEventRecord[]): TraceEventR
         .map(w => w.ev);
 }
 
+function computeDepthsFromOrder(events: TraceEventRecord[]): TraceEventRecord[] {
+    const stack: Array<any> = [];
+
+    return events.map(ev => {
+        const out = { ...ev };
+        const key = ev.spanId ?? null;
+        const isEnter = ev.type === 'enter';
+        if (isEnter) {
+            out.depth = stack.length + 1;
+            stack.push(key ?? Symbol('no-span'));
+        } else {
+            let idx = -1;
+            if (key !== null) {
+                for (let i = stack.length - 1; i >= 0; i--) {
+                    if (stack[i] === key) {
+                        idx = i;
+                        break;
+                    }
+                }
+            }
+            if (idx >= 0) {
+                out.depth = idx + 1;
+                stack.length = idx; // pop matched frame
+            } else {
+                out.depth = Math.max(1, stack.length || 1);
+                if (stack.length) stack.pop(); // best-effort unwind
+            }
+        }
+        return out;
+    });
+}
+
 function reorderTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
     if (!Array.isArray(events) || !events.length) return events;
 
@@ -914,11 +946,11 @@ const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
 const TRACE_FLUSH_DELAY_MS = 20;
 // Choose how to order trace events in payloads.
-//  - "tree" (default): rebuild a parent/child tree from spanIds for depth visualizations.
-//  - "chronological": preserve the event timestamp/arrival order to avoid shuffling across async contexts.
+//  - "chronological" (default): preserve event arrival order and recompute depths from that order.
+//  - "tree": rebuild a parent/child tree from spanIds for depth visualizations.
 const TRACE_ORDER_MODE = (() => {
     const mode = String(process.env.TRACE_ORDER_MODE || '').toLowerCase().trim();
-    return mode === 'chronological' ? 'chronological' : 'tree';
+    return mode === 'tree' ? 'tree' : 'chronological';
 })();
 // Extra grace period after res.finish to catch late fire-and-forget work before unsubscribing.
 const TRACE_LINGER_AFTER_FINISH_MS = (() => {
@@ -1445,9 +1477,9 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 
                 flushPayload = () => {
                     const balancedEvents = balanceTraceEvents(events.slice());
-                    const orderedEvents = TRACE_ORDER_MODE === 'chronological'
-                        ? sortTraceEventsChronologically(balancedEvents)
-                        : reorderTraceEvents(balancedEvents);
+                    const orderedEvents = TRACE_ORDER_MODE === 'tree'
+                        ? reorderTraceEvents(balancedEvents)
+                        : computeDepthsFromOrder(sortTraceEventsChronologically(balancedEvents));
                     const summary = summarizeEndpointFromEvents(orderedEvents);
                     const chosenEndpoint = summary.endpointTrace
                         ?? summary.preferredAppTrace
