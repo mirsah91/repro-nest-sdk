@@ -1013,8 +1013,8 @@ const TRACE_IDLE_FLUSH_MS = (() => {
 const SESSION_DRAIN_TIMEOUT_MS = (() => {
     const env = Number(process.env.SESSION_DRAIN_TIMEOUT_MS);
     if (Number.isFinite(env) && env >= 0) return env;
-    // Wait indefinitely for session requests to drain; set env to bound if desired.
-    return 0;
+    // Bound wait for draining sessions to avoid lost flushes when a request hangs.
+    return 10000;
 })();
 
 function isThenable(value: any): value is PromiseLike<any> {
@@ -1420,6 +1420,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let finished = false;
             let idleTimer: NodeJS.Timeout | null = null;
             let hardStopTimer: NodeJS.Timeout | null = null;
+            let drainTimer: NodeJS.Timeout | null = null;
             let flushPayload: null | (() => void) = null;
 
             const clearTimers = () => {
@@ -1430,6 +1431,10 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 if (hardStopTimer) {
                     try { clearTimeout(hardStopTimer); } catch {}
                     hardStopTimer = null;
+                }
+                if (drainTimer) {
+                    try { clearTimeout(drainTimer); } catch {}
+                    drainTimer = null;
                 }
             };
 
@@ -1604,7 +1609,15 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 const waitDrain = waitForSessionDrain(sid);
                 endSessionRequest(sid);
 
+                if (SESSION_DRAIN_TIMEOUT_MS > 0) {
+                    drainTimer = setTimeout(doFlush, SESSION_DRAIN_TIMEOUT_MS);
+                }
+
                 waitDrain.then(() => {
+                    if (drainTimer) {
+                        try { clearTimeout(drainTimer); } catch {}
+                        drainTimer = null;
+                    }
                     if (__TRACER_READY) {
                         bumpIdle();
                         const hardDeadlineMs = Math.max(
