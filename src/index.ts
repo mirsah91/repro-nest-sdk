@@ -644,62 +644,8 @@ function waitForSessionDrain(sessionId: string): Promise<void> {
 }
 
 function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
-    if (!Array.isArray(events) || events.length === 0) return events;
-
-    const makeKey = (ev: TraceEventRecord) =>
-        ev.spanId !== undefined && ev.spanId !== null
-            ? `span:${ev.spanId}`
-            : [ev.fn || '', ev.file || '', String(ev.line ?? ''), ev.functionType || ''].join('|');
-
-    const seenKeys = new Set<string>();
-    const balanced: TraceEventRecord[] = [];
-    const pendingExits: TraceEventRecord[] = [];
-
-    for (let i = 0; i < events.length; i++) {
-        const ev = events[i];
-        if (!ev || (ev.type !== 'enter' && ev.type !== 'exit')) {
-            balanced.push(ev);
-            continue;
-        }
-
-        balanced.push(ev);
-        if (ev.type !== 'enter') continue;
-
-        const key = makeKey(ev);
-        if (!key || seenKeys.has(key)) continue;
-
-        let hasExit = false;
-        for (let j = i + 1; j < events.length; j++) {
-            const later = events[j];
-            if (later && later.type === 'exit' && makeKey(later) === key) {
-                hasExit = true;
-                break;
-            }
-        }
-
-        if (!hasExit) {
-            seenKeys.add(key);
-            pendingExits.push({
-                t: ev.t,
-                type: 'exit',
-                fn: ev.fn,
-                file: ev.file,
-                line: ev.line,
-                functionType: ev.functionType,
-                depth: typeof ev.depth === 'number' ? Math.max(0, ev.depth - 1) : ev.depth,
-                spanId: ev.spanId ?? null,
-                parentSpanId: ev.parentSpanId ?? null,
-                args: ev.args,
-                returnValue: undefined,
-                threw: false,
-                error: undefined,
-                unawaited: true,
-            });
-        }
-    }
-
-    // Add synthetic exits at the end to avoid unwinding stacks mid-stream.
-    return balanced.concat(pendingExits);
+    // No balancing / synthetic exits — preserve raw event stream.
+    return Array.isArray(events) ? events : [];
 }
 
 function sortTraceEventsChronologically(events: TraceEventRecord[]): TraceEventRecord[] {
@@ -992,11 +938,11 @@ const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
 const TRACE_FLUSH_DELAY_MS = 20;
 // Choose how to order trace events in payloads.
-//  - "chronological" (default): preserve event arrival order and set depths using parentSpanId relationships.
+//  - "chronological" (default): preserve event arrival order (no reshuffle).
 //  - "tree": rebuild a parent/child tree from spanIds for depth visualizations (can shuffle concurrent spans).
 const TRACE_ORDER_MODE = (() => {
     const mode = String(process.env.TRACE_ORDER_MODE || '').toLowerCase().trim();
-    return mode === 'chronological' ? 'chronological' : 'tree';
+    return mode === 'tree' ? 'tree' : 'chronological';
 })();
 // Extra grace period after res.finish to catch late fire-and-forget work before unsubscribing.
 const TRACE_LINGER_AFTER_FINISH_MS = (() => {
@@ -1541,10 +1487,10 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 
                 if (!flushPayload) {
                     flushPayload = () => {
-                        const balancedEvents = balanceTraceEvents(events.slice());
-                        const orderedEvents = TRACE_ORDER_MODE === 'tree'
-                            ? reorderTraceEvents(balancedEvents)
-                            : computeDepthsFromParentsChronologically(sortTraceEventsChronologically(balancedEvents));
+                    const baseEvents = balanceTraceEvents(events.slice());
+                    const orderedEvents = TRACE_ORDER_MODE === 'tree'
+                        ? reorderTraceEvents(baseEvents)
+                        : sortTraceEventsChronologically(baseEvents);
                         const summary = summarizeEndpointFromEvents(orderedEvents);
                         const chosenEndpoint = summary.endpointTrace
                             ?? summary.preferredAppTrace
