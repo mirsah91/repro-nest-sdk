@@ -86,9 +86,9 @@ function flushQueryFinalizers(query: any, value: any, threw: boolean, error: any
     } catch {}
 }
 
-function patchMongooseExecCapture() {
+function patchMongooseExecCapture(targetMongoose: any = mongoose) {
     try {
-        const Qp: any = (mongoose as any).Query?.prototype;
+        const Qp: any = targetMongoose?.Query?.prototype;
         if (!Qp || Qp.__repro_exec_patched) return;
         const origExec = Qp.exec;
         if (typeof origExec !== 'function') return;
@@ -114,6 +114,25 @@ function patchMongooseExecCapture() {
             } catch {}
             return p;
         };
+    } catch {}
+}
+
+function patchAllKnownMongooseInstances() {
+    // Patch the SDK's bundled mongoose first.
+    patchMongooseExecCapture(mongoose as any);
+
+    // Also patch any other mongoose copies the host app might have installed (e.g., different versions).
+    try {
+        const cache = (require as any)?.cache || {};
+        const seen = new Set<any>();
+        Object.keys(cache).forEach((key) => {
+            if (!/node_modules[\\/](mongoose)[\\/]/i.test(key)) return;
+            const mod = cache[key];
+            const exp = mod?.exports;
+            if (!exp || seen.has(exp)) return;
+            seen.add(exp);
+            patchMongooseExecCapture(exp);
+        });
     } catch {}
 }
 
@@ -570,7 +589,9 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
         tracerPkg.patchHttp?.();
         applyTraceLogPreference(tracerPkg);
         __TRACER_READY = true;
-        patchMongooseExecCapture();
+        patchAllKnownMongooseInstances();
+        // Patch again on the next tick to catch mongoose copies that load after init (different versions/copies).
+        setImmediate(() => patchAllKnownMongooseInstances());
     } catch {
         __TRACER__ = null; // SDK still works without tracer
     } finally {
