@@ -87,33 +87,68 @@ function flushQueryFinalizers(query: any, value: any, threw: boolean, error: any
 }
 
 function patchMongooseExecCapture(targetMongoose: any = mongoose) {
+    // Patch Query.prototype.exec to capture resolved results for trace return values.
     try {
         const Qp: any = targetMongoose?.Query?.prototype;
-        if (!Qp || Qp.__repro_exec_patched) return;
-        const origExec = Qp.exec;
-        if (typeof origExec !== 'function') return;
-        Qp.__repro_exec_patched = true;
-        Qp.exec = function reproPatchedExec(this: any, ...args: any[]) {
-            try { (this as any).__repro_is_query = true; } catch {}
-            const p = origExec.apply(this, args);
-            try {
-                if (p && typeof p.then === 'function') {
-                    this.__repro_result_promise = p;
-                    p.then(
-                        (res: any) => {
-                            try { this.__repro_result = res; } catch {}
-                            flushQueryFinalizers(this, res, false, null);
-                            return res;
-                        },
-                        (err: any) => {
-                            flushQueryFinalizers(this, undefined, true, err);
-                            return err;
+        if (Qp && !Qp.__repro_exec_patched) {
+            const origExec = Qp.exec;
+            if (typeof origExec === 'function') {
+                Qp.__repro_exec_patched = true;
+                Qp.exec = function reproPatchedExec(this: any, ...args: any[]) {
+                    try { (this as any).__repro_is_query = true; } catch {}
+                    const p = origExec.apply(this, args);
+                    try {
+                        if (p && typeof p.then === 'function') {
+                            this.__repro_result_promise = p;
+                            p.then(
+                                (res: any) => {
+                                    try { this.__repro_result = res; } catch {}
+                                    flushQueryFinalizers(this, res, false, null);
+                                    return res;
+                                },
+                                (err: any) => {
+                                    flushQueryFinalizers(this, undefined, true, err);
+                                    return err;
+                                }
+                            );
                         }
-                    );
-                }
-            } catch {}
-            return p;
-        };
+                    } catch {}
+                    return p;
+                };
+            }
+        }
+    } catch {}
+
+    // Patch Aggregate.prototype.exec as well so aggregation pipelines surface their results in traces.
+    try {
+        const Ap: any = targetMongoose?.Aggregate?.prototype;
+        if (Ap && !Ap.__repro_agg_exec_patched) {
+            const origAggExec = Ap.exec;
+            if (typeof origAggExec === 'function') {
+                Ap.__repro_agg_exec_patched = true;
+                Ap.exec = function reproPatchedAggExec(this: any, ...args: any[]) {
+                    try { (this as any).__repro_is_query = true; } catch {}
+                    const p = origAggExec.apply(this, args);
+                    try {
+                        if (p && typeof p.then === 'function') {
+                            this.__repro_result_promise = p;
+                            p.then(
+                                (res: any) => {
+                                    try { this.__repro_result = res; } catch {}
+                                    flushQueryFinalizers(this, res, false, null);
+                                    return res;
+                                },
+                                (err: any) => {
+                                    flushQueryFinalizers(this, undefined, true, err);
+                                    return err;
+                                }
+                            );
+                        }
+                    } catch {}
+                    return p;
+                };
+            }
+        }
     } catch {}
 }
 
