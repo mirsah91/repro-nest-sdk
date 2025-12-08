@@ -157,6 +157,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
 
         function wrap(path){
             const n = path.node;
+            if (n.__repro_internal) return;
             if (n.__wrapped) return;
 
             if (isAwaiterBody(path)) {
@@ -230,6 +231,15 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 t.variableDeclarator(threwId, t.booleanLiteral(false))
             ]);
 
+            const fnIdForMark = (path.isFunctionDeclaration() || path.isFunctionExpression()) && n.id && t.isIdentifier(n.id)
+                ? n.id
+                : null;
+            const markBodyTraced = fnIdForMark
+                ? markInternal(t.expressionStatement(
+                    t.assignmentExpression('=', t.memberExpression(t.identifier(fnIdForMark.name), t.identifier('__repro_body_traced')), t.booleanLiteral(true))
+                ))
+                : null;
+
             const enter = t.expressionStatement(
                 markInternal(t.callExpression(
                     t.memberExpression(t.identifier('__trace'), t.identifier('enter')),
@@ -279,7 +289,7 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 t.blockStatement([ exit ])
             );
 
-            const prologue = [ argsDecl, localsDecl, enter ];
+            const prologue = markBodyTraced ? [ markBodyTraced, argsDecl, localsDecl, enter ] : [ argsDecl, localsDecl, enter ];
             const wrapped = t.blockStatement([ ...prologue, wrappedTry ]);
 
             if (path.isFunction() || path.isClassMethod() || path.isObjectMethod()) {
@@ -356,7 +366,6 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             if (t.isIdentifier(n.callee, { name: '__generator' })) return;
             if (t.isSuper(n.callee)) return;
             if (t.isImport(n.callee)) return;
-            if (n.optional === true) return;
 
             if (t.isMemberExpression(n.callee) && t.isIdentifier(n.callee.object, { name: '__trace' })) {
                 return;
@@ -455,6 +464,124 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
             path.node.__repro_call_wrapped = true;
         }
 
+        function wrapOptionalCall(path, state) {
+            const { node: n } = path;
+            if (n.__repro_call_wrapped) return;
+            if (n.__repro_internal) return;
+
+            if (t.isIdentifier(n.callee, { name: '__repro_call' })) return;
+            if (t.isIdentifier(n.callee, { name: '__awaiter' })) return;
+            if (t.isIdentifier(n.callee, { name: '__generator' })) return;
+            if (t.isSuper(n.callee)) return;
+            if (t.isImport(n.callee)) return;
+
+            const loc = n.loc?.start || null;
+            const mapped = loc && typeof mapOriginalPosition === 'function'
+                ? mapOriginalPosition(loc.line ?? null, loc.column ?? 0)
+                : null;
+
+            const file = mapped?.file || filenameForMeta || state.file.opts.filename || '';
+            const line = mapped?.line ?? loc?.line ?? 0;
+
+            const fileLit = t.stringLiteral(file ?? '');
+            const lineLit = t.numericLiteral(line ?? 0);
+
+            const unawaited = !isAwaitedCall(path);
+            const label = describeExpression(n.callee) || '';
+            const makeArgsArray = () => t.arrayExpression(n.arguments.map(arg => t.cloneNode(arg, true)));
+
+            const isOptMember = (t.isOptionalMemberExpression && t.isOptionalMemberExpression(n.callee)) || false;
+            if (t.isMemberExpression(n.callee) || isOptMember) {
+                const callee = n.callee;
+                const objOrig = callee.object;
+                const prop = callee.property;
+                const computed = callee.computed === true;
+
+                const needsObjGuard = Boolean(callee.optional);
+                const needsCalleeGuard = n.optional === true;
+
+                const objId = path.scope.generateUidIdentifierBasedOnNode(objOrig, 'obj');
+                const fnId = path.scope.generateUidIdentifier('fn');
+
+                const member = t.memberExpression(objId, prop, computed);
+                const fnInit = needsObjGuard
+                    ? t.conditionalExpression(
+                        t.binaryExpression('==', objId, t.nullLiteral()),
+                        t.identifier('undefined'),
+                        member
+                    )
+                    : member;
+
+                const tests = [];
+                if (needsObjGuard) tests.push(t.binaryExpression('==', objId, t.nullLiteral()));
+                if (needsCalleeGuard) tests.push(t.binaryExpression('==', fnId, t.nullLiteral()));
+
+                let guardTest = null;
+                if (tests.length === 1) guardTest = tests[0];
+                else if (tests.length === 2) guardTest = t.logicalExpression('||', tests[0], tests[1]);
+
+                const reproCall = t.callExpression(
+                    t.identifier('__repro_call'),
+                    [
+                        fnId,
+                        objId,
+                        makeArgsArray(),
+                        fileLit,
+                        lineLit,
+                        t.stringLiteral(label || ''),
+                        t.booleanLiteral(unawaited)
+                    ]
+                );
+
+                const guardedCall = guardTest
+                    ? t.conditionalExpression(guardTest, t.identifier('undefined'), reproCall)
+                    : reproCall;
+
+                const seq = t.sequenceExpression([
+                    t.assignmentExpression('=', objId, objOrig),
+                    t.assignmentExpression('=', fnId, fnInit),
+                    guardedCall
+                ]);
+
+                path.scope.push({ id: objId });
+                path.scope.push({ id: fnId });
+                path.replaceWith(seq);
+                path.node.__repro_call_wrapped = true;
+                return;
+            }
+
+            const fnOrig = n.callee;
+            const fnId = path.scope.generateUidIdentifier('fn');
+            const needsCalleeGuard = n.optional === true;
+            const guardTest = needsCalleeGuard ? t.binaryExpression('==', fnId, t.nullLiteral()) : null;
+
+            const reproCall = t.callExpression(
+                t.identifier('__repro_call'),
+                [
+                    fnId,
+                    t.nullLiteral(),
+                    makeArgsArray(),
+                    fileLit,
+                    lineLit,
+                    t.stringLiteral(label || ''),
+                    t.booleanLiteral(unawaited)
+                ]
+            );
+
+            const guardedCall = guardTest
+                ? t.conditionalExpression(guardTest, t.identifier('undefined'), reproCall)
+                : reproCall;
+
+            const seq = t.sequenceExpression([
+                t.assignmentExpression('=', fnId, fnOrig),
+                guardedCall
+            ]);
+
+            path.scope.push({ id: fnId });
+            path.replaceWith(seq);
+            path.node.__repro_call_wrapped = true;
+        }
+
         return {
             name: 'omnitrace-wrap-functions-and-calls',
             visitor: {
@@ -469,6 +596,9 @@ module.exports = function makeWrapPlugin(filenameForMeta, opts = {}) {
                 // call-site wrapping
                 CallExpression: {
                     exit(path, state) { wrapCall(path, state); }
+                },
+                OptionalCallExpression: {
+                    exit(path, state) { wrapOptionalCall(path, state); }
                 },
                 // (If you also want to wrap OptionalCallExpression in older Babel ASTs,
                 // add the same handler here)

@@ -75,6 +75,102 @@ function restoreMongooseIfNeeded() {
     } catch {}
 }
 
+function flushQueryFinalizers(query: any, value: any, threw: boolean, error: any) {
+    try {
+        const callbacks = (query as any)?.__repro_query_finalizers;
+        if (!Array.isArray(callbacks) || callbacks.length === 0) return;
+        (query as any).__repro_query_finalizers = [];
+        for (const fn of callbacks) {
+            try { fn(value, threw, error); } catch {}
+        }
+    } catch {}
+}
+
+function patchMongooseExecCapture(targetMongoose: any = mongoose) {
+    // Patch Query.prototype.exec to capture resolved results for trace return values.
+    try {
+        const Qp: any = targetMongoose?.Query?.prototype;
+        if (Qp && !Qp.__repro_exec_patched) {
+            const origExec = Qp.exec;
+            if (typeof origExec === 'function') {
+                Qp.__repro_exec_patched = true;
+                Qp.exec = function reproPatchedExec(this: any, ...args: any[]) {
+                    try { (this as any).__repro_is_query = true; } catch {}
+                    const p = origExec.apply(this, args);
+                    try {
+                        if (p && typeof p.then === 'function') {
+                            this.__repro_result_promise = p;
+                            p.then(
+                                (res: any) => {
+                                    try { this.__repro_result = res; } catch {}
+                                    flushQueryFinalizers(this, res, false, null);
+                                    return res;
+                                },
+                                (err: any) => {
+                                    flushQueryFinalizers(this, undefined, true, err);
+                                    return err;
+                                }
+                            );
+                        }
+                    } catch {}
+                    return p;
+                };
+            }
+        }
+    } catch {}
+
+    // Patch Aggregate.prototype.exec as well so aggregation pipelines surface their results in traces.
+    try {
+        const Ap: any = targetMongoose?.Aggregate?.prototype;
+        if (Ap && !Ap.__repro_agg_exec_patched) {
+            const origAggExec = Ap.exec;
+            if (typeof origAggExec === 'function') {
+                Ap.__repro_agg_exec_patched = true;
+                Ap.exec = function reproPatchedAggExec(this: any, ...args: any[]) {
+                    try { (this as any).__repro_is_query = true; } catch {}
+                    const p = origAggExec.apply(this, args);
+                    try {
+                        if (p && typeof p.then === 'function') {
+                            this.__repro_result_promise = p;
+                            p.then(
+                                (res: any) => {
+                                    try { this.__repro_result = res; } catch {}
+                                    flushQueryFinalizers(this, res, false, null);
+                                    return res;
+                                },
+                                (err: any) => {
+                                    flushQueryFinalizers(this, undefined, true, err);
+                                    return err;
+                                }
+                            );
+                        }
+                    } catch {}
+                    return p;
+                };
+            }
+        }
+    } catch {}
+}
+
+function patchAllKnownMongooseInstances() {
+    // Patch the SDK's bundled mongoose first.
+    patchMongooseExecCapture(mongoose as any);
+
+    // Also patch any other mongoose copies the host app might have installed (e.g., different versions).
+    try {
+        const cache = (require as any)?.cache || {};
+        const seen = new Set<any>();
+        Object.keys(cache).forEach((key) => {
+            if (!/node_modules[\\/](mongoose)[\\/]/i.test(key)) return;
+            const mod = cache[key];
+            const exp = mod?.exports;
+            if (!exp || seen.has(exp)) return;
+            seen.add(exp);
+            patchMongooseExecCapture(exp);
+        });
+    } catch {}
+}
+
 // ====== tiny, safe tracer auto-init (no node_modules patches) ======
 type TracerApi = {
     init?: (opts: any) => void;
@@ -480,7 +576,7 @@ function defaultTracerInitOpts(): TracerInitOpts {
         instrument: true,
         include,
         exclude,
-        mode: process.env.TRACE_MODE || 'v8',
+        mode: process.env.TRACE_MODE || 'trace',
         samplingMs: 10,
     };
 }
@@ -528,6 +624,9 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
         tracerPkg.patchHttp?.();
         applyTraceLogPreference(tracerPkg);
         __TRACER_READY = true;
+        patchAllKnownMongooseInstances();
+        // Patch again on the next tick to catch mongoose copies that load after init (different versions/copies).
+        setImmediate(() => patchAllKnownMongooseInstances());
     } catch {
         __TRACER__ = null; // SDK still works without tracer
     } finally {
@@ -561,59 +660,102 @@ function alignedNow(): number {
     return alignTimestamp(Date.now());
 }
 
-function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
-    if (!Array.isArray(events) || events.length === 0) return events;
+let __REQUEST_SEQ = 0;
+function nextRequestId(base: number | string): string {
+    const seq = (++__REQUEST_SEQ).toString(36);
+    const rand = Math.floor(Math.random() * 1e6).toString(36);
+    return `${base}-${seq}${rand}`;
+}
 
-    const makeKey = (ev: TraceEventRecord) =>
-        [ev.fn || '', ev.file || '', String(ev.line ?? ''), ev.functionType || ''].join('|');
+// Track in-flight requests per session so we can delay flushing until a session is drained.
+const sessionInFlight = new Map<string, number>();
+const sessionWaiters = new Map<string, Array<() => void>>();
 
-    const seenKeys = new Set<string>();
-    const balanced: TraceEventRecord[] = [];
+function beginSessionRequest(sessionId: string) {
+    if (!sessionId) return;
+    sessionInFlight.set(sessionId, (sessionInFlight.get(sessionId) || 0) + 1);
+}
 
-    for (let i = 0; i < events.length; i++) {
-        const ev = events[i];
-        if (!ev || (ev.type !== 'enter' && ev.type !== 'exit')) {
-            balanced.push(ev);
-            continue;
-        }
-
-        balanced.push(ev);
-        if (ev.type !== 'enter') continue;
-
-        const key = makeKey(ev);
-        if (!key || seenKeys.has(key)) continue;
-
-        let hasExit = false;
-        for (let j = i + 1; j < events.length; j++) {
-            const later = events[j];
-            if (later && later.type === 'exit' && makeKey(later) === key) {
-                hasExit = true;
-                break;
-            }
-        }
-
-        if (!hasExit) {
-            seenKeys.add(key);
-            balanced.push({
-                t: ev.t,
-                type: 'exit',
-                fn: ev.fn,
-                file: ev.file,
-                line: ev.line,
-                functionType: ev.functionType,
-                depth: typeof ev.depth === 'number' ? Math.max(0, ev.depth - 1) : ev.depth,
-                spanId: ev.spanId ?? null,
-                parentSpanId: ev.parentSpanId ?? null,
-                args: ev.args,
-                returnValue: undefined,
-                threw: false,
-                error: undefined,
-                unawaited: true,
-            });
-        }
+function endSessionRequest(sessionId: string) {
+    if (!sessionId) return;
+    const next = (sessionInFlight.get(sessionId) || 0) - 1;
+    if (next > 0) {
+        sessionInFlight.set(sessionId, next);
+        return;
     }
+    sessionInFlight.delete(sessionId);
+    const waiters = sessionWaiters.get(sessionId);
+    if (waiters && waiters.length) {
+        sessionWaiters.delete(sessionId);
+        waiters.forEach(fn => { try { fn(); } catch {} });
+    }
+}
 
-    return balanced;
+function waitForSessionDrain(sessionId: string): Promise<void> {
+    if (!sessionId) return Promise.resolve();
+    const remaining = sessionInFlight.get(sessionId) || 0;
+    if (remaining <= 0) return Promise.resolve();
+
+    return new Promise(resolve => {
+        const list = sessionWaiters.get(sessionId) || [];
+        list.push(resolve);
+        sessionWaiters.set(sessionId, list);
+        if (SESSION_DRAIN_TIMEOUT_MS > 0 && Number.isFinite(SESSION_DRAIN_TIMEOUT_MS)) {
+            setTimeout(resolve, SESSION_DRAIN_TIMEOUT_MS);
+        }
+    });
+}
+
+function balanceTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
+    // No balancing / synthetic exits — preserve raw event stream.
+    return Array.isArray(events) ? events : [];
+}
+
+function sortTraceEventsChronologically(events: TraceEventRecord[]): TraceEventRecord[] {
+    return events
+        .map((ev, idx) => ({ ev, idx }))
+        .sort((a, b) => {
+            const ta = typeof a.ev.t === 'number' ? a.ev.t : Number.POSITIVE_INFINITY;
+            const tb = typeof b.ev.t === 'number' ? b.ev.t : Number.POSITIVE_INFINITY;
+            if (ta !== tb) return ta - tb;
+            return a.idx - b.idx; // stable fallback
+        })
+        .map(w => w.ev);
+}
+
+function computeDepthsFromParentsChronologically(events: TraceEventRecord[]): TraceEventRecord[] {
+    const depthBySpan = new Map<string, number>();
+
+    const normId = (v: any) => (v === null || v === undefined ? null : String(v));
+
+    return events.map(ev => {
+        const out = { ...ev };
+        const sid = normId(ev.spanId);
+        const pid = normId(ev.parentSpanId);
+
+        if (ev.type === 'enter') {
+            const parentDepth = pid ? depthBySpan.get(pid) ?? 0 : 0;
+            const depth = Math.max(1, parentDepth + 1);
+            out.depth = depth;
+            if (sid) depthBySpan.set(sid, depth);
+            return out;
+        }
+
+        if (ev.type === 'exit') {
+            if (sid && depthBySpan.has(sid)) {
+                out.depth = depthBySpan.get(sid);
+            } else if (pid && depthBySpan.has(pid)) {
+                out.depth = Math.max(1, (depthBySpan.get(pid) ?? 0) + 1);
+            } else if (typeof ev.depth === 'number') {
+                out.depth = ev.depth;
+            } else {
+                out.depth = 1;
+            }
+            return out;
+        }
+
+        return out;
+    });
 }
 
 function reorderTraceEvents(events: TraceEventRecord[]): TraceEventRecord[] {
@@ -858,8 +1000,31 @@ const TRACE_VALUE_MAX_ITEMS = 20;
 const TRACE_VALUE_MAX_STRING = 2000;
 const TRACE_BATCH_SIZE = 100;
 const TRACE_FLUSH_DELAY_MS = 20;
+// Choose how to order trace events in payloads.
+//  - "chronological" (default): preserve event arrival order (no reshuffle).
+//  - "tree": rebuild a parent/child tree from spanIds for depth visualizations (can shuffle concurrent spans).
+const TRACE_ORDER_MODE = (() => {
+    const mode = String(process.env.TRACE_ORDER_MODE || '').toLowerCase().trim();
+    return mode === 'tree' ? 'tree' : 'chronological';
+})();
 // Extra grace period after res.finish to catch late fire-and-forget work before unsubscribing.
-const TRACE_LINGER_AFTER_FINISH_MS = 250;
+const TRACE_LINGER_AFTER_FINISH_MS = (() => {
+    const env = Number(process.env.TRACE_LINGER_AFTER_FINISH_MS);
+    if (Number.isFinite(env) && env >= 0) return env;
+    return 1000; // default 1s to catch slow async callbacks (e.g., email sends)
+})();
+const TRACE_IDLE_FLUSH_MS = (() => {
+    const env = Number(process.env.TRACE_IDLE_FLUSH_MS);
+    if (Number.isFinite(env) && env > 0) return env;
+    // Keep the listener alive until no new events arrive for this many ms after finish.
+    return 2000;
+})();
+const SESSION_DRAIN_TIMEOUT_MS = (() => {
+    const env = Number(process.env.SESSION_DRAIN_TIMEOUT_MS);
+    if (Number.isFinite(env) && env >= 0) return env;
+    // Bound wait for draining sessions to avoid lost flushes when a request hangs.
+    return 10000;
+})();
 
 function isThenable(value: any): value is PromiseLike<any> {
     return value != null && typeof value === 'object' && typeof (value as any).then === 'function';
@@ -979,6 +1144,10 @@ function sanitizeTraceValue(value: any, depth = 0, seen: WeakSet<object> = new W
     if (mongoId !== null) return mongoId;
 
     if (isMongooseQueryLike(value)) {
+        const captured = (value as any).__repro_result;
+        if (captured !== undefined) {
+            return sanitizeTraceValue(captured, depth + 1, seen);
+        }
         return summarizeMongooseQueryValue(value, depth, seen);
     }
 
@@ -1214,12 +1383,14 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
         const requestStartRaw = Date.now();
         const headerTs = readHeaderNumber(req.headers[REQUEST_START_HEADER]);
         const clockSkewMs = headerTs !== null ? headerTs - requestStartRaw : 0;
-        const rid = String(headerTs !== null ? headerTs : requestStartRaw + clockSkewMs);
+        const requestEpochMs = headerTs !== null ? headerTs : requestStartRaw + clockSkewMs;
+        const rid = nextRequestId(requestEpochMs);
         const t0 = requestStartRaw;
         const url = (req as any).originalUrl || req.url || '/';
         const path = url; // back-compat
         const key = normalizeRouteKey(req.method, url);
         const requestHeaders = sanitizeHeaders(req.headers, cfg.captureHeaders);
+        beginSessionRequest(sid);
 
         // ---- response body capture (unchanged) ----
         let capturedBody: any = undefined;
@@ -1255,8 +1426,85 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let preferredAppTrace: EndpointTraceInfo | null = null;
             let firstAppTrace: EndpointTraceInfo | null = null;
             let unsubscribe: undefined | (() => void);
-            const debugFns = new Set(['globalResponseHandler', 'sendEmails', 'joinObjectValues']);
-            const spanInfo = new Map<string | number, { fn?: string; file?: string | null; depth?: number }>();
+            let flushed = false;
+            let finished = false;
+            let finishedAt: number | null = null;
+            let lastEventAt: number = Date.now();
+            let idleTimer: NodeJS.Timeout | null = null;
+            let hardStopTimer: NodeJS.Timeout | null = null;
+            let drainTimer: NodeJS.Timeout | null = null;
+            let flushPayload: null | (() => void) = null;
+            const activeSpans = new Set<string>();
+            let anonymousSpanDepth = 0;
+            const ACTIVE_SPAN_FORCE_FLUSH_MS = 30000; // safety guard against leaks
+
+            const clearTimers = () => {
+                if (idleTimer) {
+                    try { clearTimeout(idleTimer); } catch {}
+                    idleTimer = null;
+                }
+                if (hardStopTimer) {
+                    try { clearTimeout(hardStopTimer); } catch {}
+                    hardStopTimer = null;
+                }
+                if (drainTimer) {
+                    try { clearTimeout(drainTimer); } catch {}
+                    drainTimer = null;
+                }
+            };
+
+            const hasActiveWork = () => activeSpans.size > 0 || anonymousSpanDepth > 0;
+
+            const scheduleIdleFlush = (delay: number = TRACE_IDLE_FLUSH_MS) => {
+                if (!finished || flushed) return;
+                if (hasActiveWork()) return;
+                if (idleTimer) {
+                    try { clearTimeout(idleTimer); } catch {}
+                }
+                idleTimer = setTimeout(() => doFlush(false), delay);
+            };
+
+            const doFlush = (force: boolean = false) => {
+                if (flushed) return;
+                const now = Date.now();
+                const stillActive = hasActiveWork();
+                const quietMs = now - lastEventAt;
+                const waitedFinish = finishedAt === null ? 0 : now - finishedAt;
+
+                // If work is still active and we haven't been quiet long enough, defer.
+                if (stillActive && !force) {
+                    const remaining = Math.max(0, TRACE_LINGER_AFTER_FINISH_MS - quietMs);
+                    scheduleIdleFlush(Math.max(remaining, 10));
+                    return;
+                }
+                if (stillActive && force) {
+                    // Allow forced flush after either linger window of silence or max guard.
+                    if (quietMs < TRACE_LINGER_AFTER_FINISH_MS && waitedFinish < ACTIVE_SPAN_FORCE_FLUSH_MS) {
+                        const remainingQuiet = TRACE_LINGER_AFTER_FINISH_MS - quietMs;
+                        const remainingGuard = ACTIVE_SPAN_FORCE_FLUSH_MS - waitedFinish;
+                        scheduleIdleFlush(Math.max(10, Math.min(remainingQuiet, remainingGuard)));
+                        return;
+                    }
+                }
+                flushed = true;
+                clearTimers();
+                try { unsubscribe && unsubscribe(); } catch {}
+                try { flushPayload?.(); } catch {}
+            };
+
+            const bumpIdle = () => {
+                if (!finished || flushed) return;
+                if (idleTimer) {
+                    try { clearTimeout(idleTimer); } catch {}
+                }
+                scheduleIdleFlush();
+            };
+
+            const normalizeSpanId = (val: any): string | null => {
+                if (val === null || val === undefined) return null;
+                const str = String(val);
+                return str ? str : null;
+            };
 
             try {
                 if (__TRACER__?.tracer?.on) {
@@ -1297,12 +1545,6 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 evt.unawaited = ev.unawaited === true;
                             }
 
-                            if (evt.type === 'enter' && evt.spanId != null) {
-                                spanInfo.set(evt.spanId, { fn: evt.fn, file: evt.file ?? null, depth: evt.depth });
-                            } else if (evt.type === 'exit' && evt.spanId != null && !spanInfo.has(evt.spanId)) {
-                                spanInfo.set(evt.spanId, { fn: evt.fn, file: evt.file ?? null, depth: evt.depth });
-                            }
-
                             const candidate: TraceEventForFilter = {
                                 type: evt.type,
                                 eventType: evt.type,
@@ -1313,22 +1555,32 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 library: inferLibraryNameFromFile(evt.file),
                             };
 
+                            const spanKey = normalizeSpanId(evt.spanId);
+                            if (evt.type === 'enter') {
+                                lastEventAt = Date.now();
+                                if (spanKey) {
+                                    activeSpans.add(spanKey);
+                                } else {
+                                    anonymousSpanDepth = Math.max(0, anonymousSpanDepth + 1);
+                                }
+                            } else if (evt.type === 'exit') {
+                                lastEventAt = Date.now();
+                                if (spanKey && activeSpans.has(spanKey)) {
+                                    activeSpans.delete(spanKey);
+                                } else if (!spanKey && anonymousSpanDepth > 0) {
+                                    anonymousSpanDepth = Math.max(0, anonymousSpanDepth - 1);
+                                }
+                            }
+
                             if (shouldDropTraceEvent(candidate)) {
-                                if (debugFns.has(candidate.fn || '')) {
-                                    try { process.stderr.write(`[trace-debug] dropped fn=${candidate.fn} file=${candidate.file} depth=${candidate.depth ?? ''}\n`); } catch {}
+                                if (finished) {
+                                    scheduleIdleFlush();
                                 }
                                 return;
                             }
 
-                            if (debugFns.has(evt.fn || '')) {
-                                const parentMeta = evt.parentSpanId != null ? spanInfo.get(evt.parentSpanId) : undefined;
-                                try {
-                                    process.stderr.write(
-                                        `[trace-debug] evt ${evt.type} fn=${evt.fn} span=${evt.spanId} parent=${evt.parentSpanId}` +
-                                        (parentMeta ? ` parentFn=${parentMeta.fn}` : ' parentFn=?') +
-                                        ` depth=${evt.depth}\n`
-                                    );
-                                } catch {}
+                            if (finished) {
+                                scheduleIdleFlush();
                             }
 
                             if (evt.type === 'enter' && isLikelyAppFile(evt.file)) {
@@ -1347,13 +1599,18 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             }
 
                             events.push(evt);
+                            bumpIdle();
                         });
                     }
                 }
             } catch { /* never break user code */ }
 
-            res.on('finish', () => {
-                const finishedAt = Date.now();
+            const handleDone = () => {
+                if (finished && flushed) return;
+                finished = true;
+                if (finishedAt === null) {
+                    finishedAt = Date.now();
+                }
                 if (capturedBody === undefined && chunks.length) {
                     const buf = Buffer.isBuffer(chunks[0])
                         ? Buffer.concat(chunks.map(c => (Buffer.isBuffer(c) ? c : Buffer.from(String(c)))))
@@ -1361,91 +1618,102 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                     capturedBody = coerceBodyToStorable(buf, res.getHeader?.('content-type'));
                 }
 
-                const flushPayload = () => {
-                    const balancedEvents = reorderTraceEvents(balanceTraceEvents(events.slice()));
-                    const summary = summarizeEndpointFromEvents(balancedEvents);
-                    const chosenEndpoint = summary.endpointTrace
-                        ?? summary.preferredAppTrace
-                        ?? summary.firstAppTrace
-                        ?? endpointTrace
-                        ?? preferredAppTrace
-                        ?? firstAppTrace
-                        ?? { fn: null, file: null, line: null, functionType: null };
-                    const traceBatches = chunkArray(balancedEvents, TRACE_BATCH_SIZE);
-                    const requestBody = sanitizeRequestSnapshot((req as any).body);
-                    const requestParams = sanitizeRequestSnapshot((req as any).params);
-                    const requestQuery = sanitizeRequestSnapshot((req as any).query);
+                if (!flushPayload) {
+                    flushPayload = () => {
+                    const baseEvents = balanceTraceEvents(events.slice());
+                    const orderedEvents = TRACE_ORDER_MODE === 'tree'
+                        ? reorderTraceEvents(baseEvents)
+                        : sortTraceEventsChronologically(baseEvents);
+                        const summary = summarizeEndpointFromEvents(orderedEvents);
+                        const chosenEndpoint = summary.endpointTrace
+                            ?? summary.preferredAppTrace
+                            ?? summary.firstAppTrace
+                            ?? endpointTrace
+                            ?? preferredAppTrace
+                            ?? firstAppTrace
+                            ?? { fn: null, file: null, line: null, functionType: null };
+                        const traceBatches = chunkArray(orderedEvents, TRACE_BATCH_SIZE);
+                        const requestBody = sanitizeRequestSnapshot((req as any).body);
+                        const requestParams = sanitizeRequestSnapshot((req as any).params);
+                        const requestQuery = sanitizeRequestSnapshot((req as any).query);
 
-                    const requestPayload: Record<string, any> = {
-                        rid,
-                        method: req.method,
-                        url,
-                        path,
-                        status: res.statusCode,
-                        durMs: Date.now() - t0,
-                        headers: requestHeaders,
-                        key,
-                        respBody: capturedBody,
-                        trace: traceBatches.length ? undefined : '[]',
-                    };
-                    if (requestBody !== undefined) requestPayload.body = requestBody;
-                    if (requestParams !== undefined) requestPayload.params = requestParams;
-                    if (requestQuery !== undefined) requestPayload.query = requestQuery;
-                    requestPayload.entryPoint = chosenEndpoint;
+                        const requestPayload: Record<string, any> = {
+                            rid,
+                            method: req.method,
+                            url,
+                            path,
+                            status: res.statusCode,
+                            durMs: Date.now() - t0,
+                            headers: requestHeaders,
+                            key,
+                            respBody: capturedBody,
+                            trace: traceBatches.length ? undefined : '[]',
+                        };
+                        if (requestBody !== undefined) requestPayload.body = requestBody;
+                        if (requestParams !== undefined) requestPayload.params = requestParams;
+                        if (requestQuery !== undefined) requestPayload.query = requestQuery;
+                        requestPayload.entryPoint = chosenEndpoint;
 
-                    try {
-                        const sample = balancedEvents.slice(0, 5).map(ev => ({
-                            type: ev.type,
-                            fn: ev.fn,
-                            spanId: ev.spanId,
-                            parentSpanId: ev.parentSpanId,
-                            depth: ev.depth
-                        }));
-                        process.stderr.write(`[trace-debug] flush events=${balancedEvents.length} batches=${traceBatches.length} entry=${chosenEndpoint.fn || '(none)'} sample=${JSON.stringify(sample)}\n`);
-                    } catch {}
+                        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
+                            entries: [{
+                                actionId: aid,
+                                request: requestPayload,
+                                t: alignedNow(),
+                            }]
+                        });
 
-                    post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-                        entries: [{
-                            actionId: aid,
-                            request: requestPayload,
-                            t: alignedNow(),
-                        }]
-                    });
+                        if (traceBatches.length) {
+                            for (let i = 0; i < traceBatches.length; i++) {
+                                const batch = traceBatches[i];
+                                let traceStr = '[]';
+                                try { traceStr = JSON.stringify(batch); } catch {}
 
-                    if (traceBatches.length) {
-                        for (let i = 0; i < traceBatches.length; i++) {
-                            const batch = traceBatches[i];
-                            let traceStr = '[]';
-                            try { traceStr = JSON.stringify(batch); } catch {}
-
-                            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-                                entries: [{
-                                    actionId: aid,
-                                    trace: traceStr,
-                                    traceBatch: {
-                                        rid,
-                                        index: i,
-                                        total: traceBatches.length,
-                                    },
-                                    t: alignedNow(),
-                                }],
-                            });
+                                post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
+                                    entries: [{
+                                        actionId: aid,
+                                        trace: traceStr,
+                                        traceBatch: {
+                                            rid,
+                                            index: i,
+                                            total: traceBatches.length,
+                                        },
+                                        t: alignedNow(),
+                                    }],
+                                });
+                            }
                         }
-                    }
-                };
-
-                const scheduleFlush = () => {
-                    try { unsubscribe && unsubscribe(); } catch {}
-                    try { process.stderr.write(`[trace-debug] scheduleFlush after ${Date.now() - finishedAt}ms events=${events.length}\n`); } catch {}
-                    flushPayload();
-                };
-
-                if (__TRACER_READY) {
-                    setTimeout(scheduleFlush, TRACE_FLUSH_DELAY_MS + TRACE_LINGER_AFTER_FINISH_MS);
-                } else {
-                    scheduleFlush();
+                    };
                 }
-            });
+
+                const waitDrain = waitForSessionDrain(sid);
+                endSessionRequest(sid);
+
+                if (SESSION_DRAIN_TIMEOUT_MS > 0) {
+                    drainTimer = setTimeout(() => doFlush(true), SESSION_DRAIN_TIMEOUT_MS);
+                }
+
+                waitDrain.then(() => {
+                    if (drainTimer) {
+                        try { clearTimeout(drainTimer); } catch {}
+                        drainTimer = null;
+                    }
+                    if (__TRACER_READY) {
+                        bumpIdle();
+                        const hardDeadlineMs = Math.max(
+                            TRACE_FLUSH_DELAY_MS + TRACE_LINGER_AFTER_FINISH_MS,
+                            TRACE_IDLE_FLUSH_MS + TRACE_FLUSH_DELAY_MS,
+                        );
+                        hardStopTimer = setTimeout(() => doFlush(true), hardDeadlineMs);
+                    } else {
+                        doFlush(true);
+                    }
+                }).catch(() => {
+                    doFlush(true);
+                });
+            };
+
+            res.on('finish', handleDone);
+            res.on('close', handleDone);
 
             next();
         }));

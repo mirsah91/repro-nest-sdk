@@ -40,43 +40,52 @@ function wrapFunction(original, label, file, line) {
 
     // copy a few common props (name/length are non-writable; don’t force)
     try { wrapped[SYM_SKIP_WRAP] = true; } catch {}
+    try { Object.defineProperty(wrapped, '__repro_instrumented', { value: true, configurable: true }); } catch {}
     markWrapped(wrapped);
     return wrapped;
 }
 
 function wrapObjectMethods(obj, file) {
-    if (!obj || typeof obj !== 'object') return obj;
+    const seen = new WeakSet();
+    const maxDepth = 4;
 
-    // own props
-    for (const k of Object.getOwnPropertyNames(obj)) {
-        const d = Object.getOwnPropertyDescriptor(obj, k);
-        if (!d) continue;
-        if (d.get || d.set) continue; // never wrap accessors
-        if (SKIP_METHOD_NAMES.has(k)) continue;
+    const visit = (target, depth = 0) => {
+        if (!target || (typeof target !== 'object' && typeof target !== 'function')) return;
+        if (seen.has(target)) return;
+        if (depth > maxDepth) return;
+        seen.add(target);
 
-        if (typeof d.value === 'function') {
-            const v = d.value;
-            if (!alreadyWrapped(v)) {
-                const w = wrapFunction(v, String(k), file, 0);
-                try { shimmer.wrap(obj, k, () => w); } catch {}
+        // own props
+        for (const k of Object.getOwnPropertyNames(target)) {
+            const d = Object.getOwnPropertyDescriptor(target, k);
+            if (!d) continue;
+            if (d.get || d.set) continue; // never wrap accessors
+            if (SKIP_METHOD_NAMES.has(k)) continue;
+
+            if (typeof d.value === 'function') {
+                const v = d.value;
+                if (!alreadyWrapped(v)) {
+                    const w = wrapFunction(v, String(k), file, 0);
+                    try { shimmer.wrap(target, k, () => w); } catch {
+                        try { target[k] = w; } catch {}
+                    }
+                }
+                continue;
+            }
+
+            if (d.value && (typeof d.value === 'object' || typeof d.value === 'function')) {
+                visit(d.value, depth + 1);
             }
         }
-    }
 
-    // class prototype methods (one level)
-    const proto = Object.getPrototypeOf(obj);
-    if (proto && proto !== Object.prototype) {
-        for (const k of Object.getOwnPropertyNames(proto)) {
-            if (k === 'constructor' || SKIP_METHOD_NAMES.has(k)) continue;
-            const d = Object.getOwnPropertyDescriptor(proto, k);
-            if (!d || d.get || d.set) continue;
-            if (typeof d.value === 'function' && !alreadyWrapped(d.value)) {
-                const w = wrapFunction(d.value, String(k), file, 0);
-                try { shimmer.wrap(proto, k, () => w); } catch {}
-            }
+        // class prototype methods (walk depth once)
+        const proto = Object.getPrototypeOf(target);
+        if (proto && proto !== Object.prototype) {
+            visit(proto, depth + 1);
         }
-    }
+    };
 
+    visit(obj, 0);
     return obj;
 }
 
@@ -117,10 +126,13 @@ function instrumentExports(exports, filename, moduleName) {
     // Generic: recursively wrap functions on object exports
     try {
         if (typeof exports === 'function') {
-            return wrapFunction(exports, moduleName || path.basename(filename), filename, 0);
+            const wrapped = wrapFunction(exports, moduleName || path.basename(filename), filename, 0);
+            try { wrapObjectMethods(wrapped.prototype, filename); } catch {}
+            return wrapped;
         }
         if (exports && typeof exports === 'object') {
-            return wrapObjectMethods(exports, filename);
+            const wrappedObj = wrapObjectMethods(exports, filename);
+            return wrappedObj;
         }
     } catch {}
 

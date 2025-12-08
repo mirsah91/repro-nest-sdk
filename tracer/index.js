@@ -3,6 +3,8 @@
 const {
     trace,
     patchHttp,
+    patchArrayIterators,
+    patchPromise,
     startV8,
     printV8,
     patchConsole,
@@ -27,7 +29,7 @@ function init(opts = {}) {
             'classProperties','classPrivateProperties','classPrivateMethods',
             'dynamicImport','topLevelAwait','typescript',
         ],
-        mode = process.env.TRACE_MODE || 'v8',
+        mode = process.env.TRACE_MODE || 'trace',
         samplingMs = 10,
         functionLogs,
     } = opts;
@@ -35,6 +37,8 @@ function init(opts = {}) {
     // install http ALS context so Express/Nest/Fastify get traceIds without extra code
     patchHttp();
     patchConsole();
+    patchArrayIterators();
+    patchPromise();
 
     if (typeof functionLogs === 'boolean') setFunctionLogsEnabled(functionLogs);
 
