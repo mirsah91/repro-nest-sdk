@@ -1810,7 +1810,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const before = meta.before ?? null;
             const after = this.toObject({ depopulate: true });
             const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
-            const spanContext = meta.spanContext || captureSpanContext(this);
+            const spanContext = captureSpanContext(this) || meta.spanContext || captureSpanContext();
 
             const query = meta.wasNew
                 ? { op: 'insertOne', doc: after }
@@ -1854,7 +1854,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const before = (this as any).__repro_before ?? null;
             const after = res ?? null;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
-            const spanContext = (this as any).__repro_spanContext || captureSpanContext(this);
+            const spanContext = captureSpanContext(this) || (this as any).__repro_spanContext || captureSpanContext();
             const pk = after?._id ?? before?._id;
 
             post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
@@ -1891,7 +1891,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             if (!before) return;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
             const filter = (this as any).__repro_filter ?? { _id: before._id };
-            const spanContext = (this as any).__repro_spanContext || captureSpanContext(this);
+            const spanContext = captureSpanContext(this) || (this as any).__repro_spanContext || captureSpanContext();
             post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
                     actionId: (getCtx() as Ctx).aid!,
@@ -1944,7 +1944,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                         t0: Date.now(),
                         collection: this?.model?.collection?.name || 'unknown',
                         op,
-                        spanContext: captureSpanContext(this),
+                        spanContext: null,
                         filter: sanitizeDbValue(this.getFilter?.() ?? this._conditions ?? undefined),
                         update: sanitizeDbValue(this.getUpdate?.() ?? this._update ?? undefined),
                         projection: sanitizeDbValue(this.projection?.() ?? this._fields ?? undefined),
@@ -1955,7 +1955,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                         t0: Date.now(),
                         collection: 'unknown',
                         op,
-                        spanContext: captureSpanContext(this),
+                        spanContext: null,
                     };
                 }
                 next();
@@ -1967,7 +1967,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
 
                 const meta = (this as any).__repro_qmeta || { t0: Date.now(), collection: 'unknown', op };
                 const resultMeta = summarizeQueryResult(op, res);
-                const spanContext = meta.spanContext || captureSpanContext(this);
+                const spanContext = captureSpanContext(this) || meta.spanContext || captureSpanContext();
 
                 emitDbQuery(cfg, sid, aid, {
                     collection: meta.collection,
@@ -1977,6 +1977,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                     durMs: Date.now() - meta.t0,
                     t: alignedNow(),
                     spanContext,
+                    spanSource: this,
                 });
             });
         }
@@ -1991,13 +1992,13 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                     t0: Date.now(),
                     collection: this?.collection?.name || this?.model?.collection?.name || 'unknown',
                     docs: sanitizeDbValue(docs),
-                    spanContext: captureSpanContext(this),
+                    spanContext: null,
                 };
             } catch {
                 (this as any).__repro_insert_meta = {
                     t0: Date.now(),
                     collection: 'unknown',
-                    spanContext: captureSpanContext(this),
+                    spanContext: null,
                 };
             }
             next();
@@ -2008,7 +2009,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             if (!sid) return;
             const meta = (this as any).__repro_insert_meta || { t0: Date.now(), collection: 'unknown' };
             const resultMeta = Array.isArray(docs) ? { inserted: docs.length } : summarizeQueryResult('insertMany', docs);
-            const spanContext = meta.spanContext || captureSpanContext(this);
+            const spanContext = captureSpanContext(this) || meta.spanContext || captureSpanContext();
 
             emitDbQuery(cfg, sid, aid, {
                 collection: meta.collection,
@@ -2018,6 +2019,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 durMs: Date.now() - meta.t0,
                 t: alignedNow(),
                 spanContext,
+                spanSource: this,
             });
         } as any);
 
@@ -2027,13 +2029,13 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                     t0: Date.now(),
                     collection: this?.collection?.name || this?.model?.collection?.name || 'unknown',
                     ops: sanitizeDbValue(ops),
-                    spanContext: captureSpanContext(this),
+                    spanContext: null,
                 };
             } catch {
                 (this as any).__repro_bulk_meta = {
                     t0: Date.now(),
                     collection: 'unknown',
-                    spanContext: captureSpanContext(this),
+                    spanContext: null,
                 };
             }
             next();
@@ -2045,7 +2047,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const meta = (this as any).__repro_bulk_meta || { t0: Date.now(), collection: 'unknown' };
             const bulkResult = summarizeBulkResult(res);
             const resultMeta = { ...bulkResult, result: sanitizeResultForMeta(res?.result ?? res) };
-            const spanContext = meta.spanContext || captureSpanContext(this);
+            const spanContext = captureSpanContext(this) || meta.spanContext || captureSpanContext();
 
             emitDbQuery(cfg, sid, aid, {
                 collection: meta.collection,
@@ -2055,6 +2057,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 durMs: Date.now() - meta.t0,
                 t: alignedNow(),
                 spanContext,
+                spanSource: this,
             });
         } as any);
 
@@ -2068,7 +2071,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                         this?._model?.collection?.name ||
                         (this?.model && this.model.collection?.name) ||
                         'unknown',
-                    spanContext: captureSpanContext(this),
+                    spanContext: null,
                     pipeline: sanitizeDbValue(this.pipeline?.() ?? this._pipeline ?? undefined),
                 };
             } catch {
@@ -2076,7 +2079,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                     t0: Date.now(),
                     collection: 'unknown',
                     pipeline: undefined,
-                    spanContext: captureSpanContext(this),
+                    spanContext: null,
                 };
             }
             next();
@@ -2088,7 +2091,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
 
             const meta = (this as any).__repro_aggmeta || { t0: Date.now(), collection: 'unknown' };
             const resultMeta = summarizeQueryResult('aggregate', res);
-            const spanContext = meta.spanContext || captureSpanContext(this);
+            const spanContext = captureSpanContext(this) || meta.spanContext || captureSpanContext();
 
             emitDbQuery(cfg, sid, aid, {
                 collection: meta.collection,
@@ -2098,6 +2101,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 durMs: Date.now() - meta.t0,
                 t: alignedNow(),
                 spanContext,
+                spanSource: this,
             });
         });
     };
@@ -2215,7 +2219,7 @@ function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
         durMs: payload.durMs ?? undefined,
         pk: null, before: null, after: null,
         error: payload.error ?? undefined,
-    }, payload?.spanContext);
+    }, payload?.spanContext, payload?.spanSource);
     post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
         entries: [{
             actionId: aid ?? null,
