@@ -262,12 +262,6 @@ const trace = {
                         return;
                     }
                     if (queueQueryFinalizer(rv, finalize)) return;
-                    setQuerySpanContext(rv, {
-                        traceId: traceIdAtExit,
-                        spanId: spanForExit.id,
-                        parentSpanId: spanForExit.parentId,
-                        depth: spanForExit.depth ?? depthAtExit
-                    });
                     emitNow({ unawaited: forceUnawaited, returnValue: rv }, spanForExit, spanStackForExit);
                     return;
                 }
@@ -278,12 +272,6 @@ const trace = {
             }
 
             if (isQuery) {
-                setQuerySpanContext(rv, {
-                    traceId: traceIdAtExit,
-                    spanId: spanInfoPeek.id,
-                    parentSpanId: spanInfoPeek.parentId,
-                    depth: spanInfoPeek.depth ?? depthAtExit
-                });
                 emitNow({ unawaited: forceUnawaited });
                 return;
             }
@@ -851,28 +839,6 @@ async function printV8(){ const p=await stopV8(); const s=summarize(p);
 function getCurrentTraceId() {
     const s = als.getStore();
     return s && s.traceId || null;
-}
-
-function setQuerySpanContext(target, ctx) {
-    if (!target || typeof target !== 'object' || !ctx) return;
-    const safeCtx = {
-        traceId: ctx.traceId || null,
-        spanId: ctx.spanId ?? null,
-        parentSpanId: ctx.parentSpanId ?? null,
-        depth: ctx.depth ?? null
-    };
-    try {
-        if (!target.__repro_span_context) {
-            Object.defineProperty(target, '__repro_span_context', {
-                value: safeCtx,
-                configurable: true,
-                writable: true,
-                enumerable: false
-            });
-        }
-    } catch {
-        try { target.__repro_span_context = safeCtx; } catch {}
-    }
 }
 
 function getCurrentSpanContext() {
