@@ -841,6 +841,32 @@ function getCurrentTraceId() {
     return s && s.traceId || null;
 }
 
+function getCurrentSpanContext() {
+    try {
+        const store = als.getStore();
+        if (!store) return null;
+
+        const stack = Array.isArray(store.__repro_span_stack) ? store.__repro_span_stack : [];
+        const top = stack.length ? stack[stack.length - 1] : null;
+        const spanId = top && top.id != null ? top.id : null;
+        const parentSpanId = top && top.parentId != null
+            ? top.parentId
+            : (stack.length >= 2 ? (stack[stack.length - 2]?.id ?? null) : null);
+        const depth = top && top.depth != null
+            ? top.depth
+            : (typeof store.depth === 'number'
+                ? store.depth
+                : (stack.length ? stack.length : null));
+
+        const traceId = store.traceId || null;
+
+        if (spanId === null && parentSpanId === null && traceId === null) return null;
+        return { traceId, spanId, parentSpanId, depth: depth == null ? null : depth };
+    } catch {
+        return null;
+    }
+}
+
 // ---- Promise propagation fallback: ensure continuations run with the captured store ----
 let PROMISE_PATCHED = false;
 function patchPromise() {
@@ -885,6 +911,7 @@ module.exports = {
     printV8,
     patchConsole,
     getCurrentTraceId,
+    getCurrentSpanContext,
     setFunctionLogsEnabled,
     // export symbols so the require hook can tag function origins
     SYM_SRC_FILE,
