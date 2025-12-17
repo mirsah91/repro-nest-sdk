@@ -684,6 +684,27 @@ export function isReproTracingEnabled() { return __TRACER_READY; }
 
 function captureSpanContextFromTracer(source?: any): SpanContext | null {
     try {
+        // Prefer a preserved store captured at the call-site for thenables (e.g., Mongoose Query),
+        // because the tracer intentionally detaches spans before the query is actually executed.
+        const promiseStore = source && source[Symbol.for('__repro_promise_store')];
+        if (promiseStore) {
+            const stack = Array.isArray(promiseStore.__repro_span_stack) ? promiseStore.__repro_span_stack : [];
+            const top = stack.length ? stack[stack.length - 1] : null;
+            const spanId = top && top.id != null ? top.id : null;
+            const parentSpanId = top && top.parentId != null
+                ? top.parentId
+                : (stack.length >= 2 ? (stack[stack.length - 2]?.id ?? null) : null);
+            const depth = top && top.depth != null
+                ? top.depth
+                : (typeof promiseStore.depth === 'number'
+                    ? promiseStore.depth
+                    : (stack.length ? stack.length : null));
+            const traceId = promiseStore.traceId ?? null;
+            if (traceId || spanId !== null || parentSpanId !== null) {
+                return { traceId, spanId, parentSpanId, depth: depth == null ? null : depth };
+            }
+        }
+
         const fromSource = source && source.__repro_span_context;
         if (fromSource) {
             return {
