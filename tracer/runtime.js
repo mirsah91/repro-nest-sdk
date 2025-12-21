@@ -545,7 +545,13 @@ if (!global.__repro_call) {
                         const perCallStore = cloneStore(baseStoreSnapshot);
                         let result;
                         als.run(perCallStore, () => {
-                            result = arg.apply(this, arguments);
+                            // Support both callbacks and constructors: some libraries (e.g., class-transformer)
+                            // pass class constructors as args and invoke them with `new`.
+                            if (new.target) {
+                                result = Reflect.construct(arg, arguments, arg);
+                            } else {
+                                result = arg.apply(this, arguments);
+                            }
                         });
                         return result;
                     };

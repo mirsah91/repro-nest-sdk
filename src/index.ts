@@ -736,6 +736,23 @@ function captureSpanContextFromTracer(source?: any): SpanContext | null {
     return null;
 }
 
+function isExcludedSpanId(spanId: string | number | null | undefined): boolean {
+    if (spanId === null || spanId === undefined) return false;
+    try {
+        const excluded = (getCtx() as Ctx).excludedSpanIds;
+        if (!excluded || excluded.size === 0) return false;
+        return excluded.has(String(spanId));
+    } catch {
+        return false;
+    }
+}
+
+function shouldCaptureDbSpan(span: SpanContext | null | undefined): span is SpanContext {
+    if (!span || span.spanId === null || span.spanId === undefined) return false;
+    if (isExcludedSpanId(span.spanId)) return false;
+    return true;
+}
+
 function attachSpanContext<T extends Record<string, any>>(target: T, span?: SpanContext | null): T {
     if (!target) return target;
     const ctx = span ?? captureSpanContextFromTracer();
@@ -745,7 +762,7 @@ function attachSpanContext<T extends Record<string, any>>(target: T, span?: Span
     return target;
 }
 
-type Ctx = { sid?: string; aid?: string; clockSkewMs?: number };
+type Ctx = { sid?: string; aid?: string; clockSkewMs?: number; excludedSpanIds?: Set<string> };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
@@ -1525,7 +1542,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             return fn();
         };
 
-        runInTrace(() => als.run({ sid, aid, clockSkewMs }, () => {
+        runInTrace(() => als.run({ sid, aid, clockSkewMs, excludedSpanIds: new Set<string>() }, () => {
             const events: TraceEventRecord[] = [];
             let endpointTrace: EndpointTraceInfo | null = null;
             let preferredAppTrace: EndpointTraceInfo | null = null;
@@ -1660,6 +1677,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 library: inferLibraryNameFromFile(evt.file),
                             };
 
+                            const dropEvent = shouldDropTraceEvent(candidate);
                             const spanKey = normalizeSpanId(evt.spanId);
                             if (evt.type === 'enter') {
                                 lastEventAt = Date.now();
@@ -1677,7 +1695,10 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 }
                             }
 
-                            if (shouldDropTraceEvent(candidate)) {
+                            if (dropEvent) {
+                                if (evt.type === 'enter' && spanKey) {
+                                    try { (getCtx() as Ctx).excludedSpanIds?.add(spanKey); } catch {}
+                                }
                                 if (finished) {
                                     scheduleIdleFlush();
                                 }
@@ -1865,6 +1886,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const after = this.toObject({ depopulate: true });
             const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
             const spanContext = meta.spanContext || captureSpanContextFromTracer(this);
+            if (!shouldCaptureDbSpan(spanContext)) return;
 
             const query = meta.wasNew
                 ? { op: 'insertOne', doc: after }
@@ -1909,6 +1931,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const after = res ?? null;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
             const spanContext = (this as any).__repro_spanContext || captureSpanContextFromTracer(this);
+            if (!shouldCaptureDbSpan(spanContext)) return;
             const pk = after?._id ?? before?._id;
 
             post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
@@ -1946,6 +1969,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
             const filter = (this as any).__repro_filter ?? { _id: before._id };
             const spanContext = (this as any).__repro_spanContext || captureSpanContextFromTracer(this);
+            if (!shouldCaptureDbSpan(spanContext)) return;
             post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
                 entries: [{
                     actionId: (getCtx() as Ctx).aid!,
@@ -2261,6 +2285,8 @@ function dehydrateComplexValue(value: any) {
 
 function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
     if (!sid) return;
+    const spanContext = payload?.spanContext ?? captureSpanContextFromTracer();
+    if (!shouldCaptureDbSpan(spanContext)) return;
     const dbEntry = attachSpanContext({
         collection: payload.collection,
         op: payload.op,
@@ -2269,7 +2295,7 @@ function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
         durMs: payload.durMs ?? undefined,
         pk: null, before: null, after: null,
         error: payload.error ?? undefined,
-    }, payload?.spanContext);
+    }, spanContext);
     post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
         entries: [{
             actionId: aid ?? null,
