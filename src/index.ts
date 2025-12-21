@@ -236,6 +236,7 @@ export type TraceEventForFilter = {
     eventType: TraceEventPhase;
     functionType?: string | null;
     fn?: string;
+    wrapperClass?: string | null;
     file?: string | null;
     depth?: number;
     library?: string | null;
@@ -267,19 +268,29 @@ type EndpointTraceInfo = {
 
 export type HeaderRule = string | RegExp;
 export type HeaderCaptureOptions = {
-    /** When true, sensitive headers such as Authorization are kept; default redacts them. */
+    /** When true, sensitive headers such as Authorization are kept unmasked; default masks them. */
     allowSensitiveHeaders?: boolean;
-    /** Additional header names (string or RegExp) to drop from captures. */
+    /**
+     * Header names (string or RegExp) to mask.
+     * `dropHeaders` is kept for backward-compatibility and treated as an alias for `maskHeaders`.
+     */
+    maskHeaders?: HeaderRule | HeaderRule[];
+    /** @deprecated Alias for {@link maskHeaders}. */
     dropHeaders?: HeaderRule | HeaderRule[];
-    /** Explicit allowlist that overrides defaults and drop rules. */
+    /**
+     * Header names (string or RegExp) to keep unmasked, overriding defaults and `maskHeaders`.
+     * `keepHeaders` is kept for backward-compatibility and treated as an alias for `unmaskHeaders`.
+     */
+    unmaskHeaders?: HeaderRule | HeaderRule[];
+    /** @deprecated Alias for {@link unmaskHeaders}. */
     keepHeaders?: HeaderRule | HeaderRule[];
 };
 
 type NormalizedHeaderCapture = {
     enabled: boolean;
     allowSensitive: boolean;
-    drop: HeaderRule[];
-    keep: HeaderRule[];
+    mask: HeaderRule[];
+    unmask: HeaderRule[];
 };
 
 /** Lightweight helper to disable every trace emitted from specific files. */
@@ -301,6 +312,17 @@ export type DisableFunctionTraceRule = {
     fn?: TraceRulePattern;
     /** Function name (e.g. `"findOne"`, `/^UserService\./`). */
     functionName?: TraceRulePattern;
+    /** Shortcut for {@link wrapperClass}. */
+    wrapper?: TraceRulePattern;
+    /**
+     * Wrapper/owner name derived from {@link functionName} (e.g. `"UserService"` in `"UserService.create"`).
+     * Useful when multiple functions share the same method name.
+     */
+    wrapperClass?: TraceRulePattern;
+    /** Alias for {@link wrapperClass}. */
+    className?: TraceRulePattern;
+    /** Alias for {@link wrapperClass}. */
+    owner?: TraceRulePattern;
     /** Absolute file path where the function was defined. */
     file?: TraceRulePattern;
     /** Shortcut for {@link library}. */
@@ -322,6 +344,45 @@ export type DisableFunctionTracePredicate = (event: TraceEventForFilter) => bool
 export type DisableFunctionTraceConfig =
     | DisableFunctionTraceRule
     | DisableFunctionTracePredicate;
+
+export type ReproMaskTarget =
+    | 'request.headers'
+    | 'request.body'
+    | 'request.params'
+    | 'request.query'
+    | 'response.body'
+    | 'trace.args'
+    | 'trace.returnValue'
+    | 'trace.error';
+
+export type ReproMaskWhen = DisableFunctionTraceRule & {
+    /** Match HTTP method (e.g. `"GET"`, `/^post$/i`). */
+    method?: TraceRulePattern;
+    /** Match request path without query string (e.g. `"/api/auth/login"`). */
+    path?: TraceRulePattern;
+    /** Match normalized endpoint key (e.g. `"POST /api/auth/login"`). */
+    key?: TraceRulePattern;
+};
+
+export type ReproMaskRule = {
+    when?: ReproMaskWhen;
+    target: ReproMaskTarget | ReproMaskTarget[];
+    /**
+     * Dot/bracket paths to mask (supports `*`, `[0]`, `[*]`).
+     * Examples: `"password"`, `"user.token"`, `"items[*].serial"`, `"0.password"` (for trace args arrays).
+     */
+    paths?: string | string[];
+    /** Key name patterns to mask anywhere in the payload. */
+    keys?: TraceRulePattern;
+    /** Override replacement value for this rule (defaults to config replacement / `"[REDACTED]"`). */
+    replacement?: any;
+};
+
+export type ReproMaskingConfig = {
+    /** Default replacement value (defaults to `"[REDACTED]"`). */
+    replacement?: any;
+    rules?: ReproMaskRule[] | null;
+};
 
 const DEFAULT_INTERCEPTOR_TRACE_RULES: DisableFunctionTraceConfig[] = [
     { fn: /switchToHttp$/i },
@@ -403,9 +464,29 @@ function inferLibraryNameFromFile(file?: string | null): string | null {
     return segments[0] || null;
 }
 
+function inferWrapperClassFromFn(fn?: string | null): string | null {
+    if (!fn) return null;
+    const raw = String(fn);
+    if (!raw) return null;
+    const hashIdx = raw.indexOf('#');
+    if (hashIdx > 0) {
+        const left = raw.slice(0, hashIdx).trim();
+        return left || null;
+    }
+    const dotIdx = raw.lastIndexOf('.');
+    if (dotIdx > 0) {
+        const left = raw.slice(0, dotIdx).trim();
+        return left || null;
+    }
+    return null;
+}
+
 function matchesRule(rule: DisableFunctionTraceRule, event: TraceEventForFilter): boolean {
     const namePattern = rule.fn ?? rule.functionName;
     if (!matchesPattern(event.fn, namePattern)) return false;
+
+    const wrapperPattern = rule.wrapper ?? rule.wrapperClass ?? rule.className ?? rule.owner;
+    if (!matchesPattern(event.wrapperClass, wrapperPattern)) return false;
 
     if (!matchesPattern(event.file, rule.file)) return false;
 
@@ -1421,6 +1502,8 @@ const DEFAULT_SENSITIVE_HEADERS: Array<string | RegExp> = [
     'set-cookie',
 ];
 
+const DEFAULT_MASK_REPLACEMENT = '[REDACTED]';
+
 function normalizeHeaderRules(rules?: HeaderRule | HeaderRule[] | null): HeaderRule[] {
     return normalizePatternArray<HeaderRule>(rules || []);
 }
@@ -1438,14 +1521,14 @@ function matchesHeaderRule(name: string, rules: HeaderRule[]): boolean {
 
 function normalizeHeaderCaptureConfig(raw?: boolean | HeaderCaptureOptions): NormalizedHeaderCapture {
     if (raw === false) {
-        return { enabled: false, allowSensitive: false, drop: [], keep: [] };
+        return { enabled: false, allowSensitive: false, mask: [], unmask: [] };
     }
     const opts: HeaderCaptureOptions = raw && raw !== true ? raw : {};
     return {
         enabled: true,
         allowSensitive: opts.allowSensitiveHeaders === true,
-        drop: normalizeHeaderRules(opts.dropHeaders),
-        keep: normalizeHeaderRules(opts.keepHeaders),
+        mask: [...normalizeHeaderRules(opts.maskHeaders), ...normalizeHeaderRules(opts.dropHeaders)],
+        unmask: [...normalizeHeaderRules(opts.unmaskHeaders), ...normalizeHeaderRules(opts.keepHeaders)],
     };
 }
 
@@ -1466,22 +1549,208 @@ function sanitizeHeaders(headers: any, rawCfg?: boolean | HeaderCaptureOptions) 
     const cfg = normalizeHeaderCaptureConfig(rawCfg);
     if (!cfg.enabled) return {};
 
-    const dropList = cfg.allowSensitive ? cfg.drop : [...DEFAULT_SENSITIVE_HEADERS, ...cfg.drop];
     const out: Record<string, any> = {};
 
     for (const [rawKey, rawVal] of Object.entries(headers || {})) {
         const key = String(rawKey || '').toLowerCase();
         if (!key) continue;
-        const shouldDrop = matchesHeaderRule(key, dropList);
-        const keep = matchesHeaderRule(key, cfg.keep);
-        if (shouldDrop && !keep) continue;
-
         const sanitizedValue = sanitizeHeaderValue(rawVal);
         if (sanitizedValue !== undefined) {
             out[key] = sanitizedValue;
         }
     }
+
+    const maskList = cfg.allowSensitive ? cfg.mask : [...DEFAULT_SENSITIVE_HEADERS, ...cfg.mask];
+    Object.keys(out).forEach((key) => {
+        if (!matchesHeaderRule(key, maskList)) return;
+        if (matchesHeaderRule(key, cfg.unmask)) return;
+        const current = out[key];
+        if (Array.isArray(current)) {
+            out[key] = current.map(() => DEFAULT_MASK_REPLACEMENT);
+            return;
+        }
+        out[key] = DEFAULT_MASK_REPLACEMENT;
+    });
+
     return out;
+}
+
+// ===================================================================
+// Masking (request/response payloads + trace args/returns/errors)
+// ===================================================================
+type NormalizedMaskRule = {
+    when?: ReproMaskWhen;
+    targets: ReproMaskTarget[];
+    paths: string[][];
+    keys?: TraceRulePattern;
+    replacement: any;
+};
+
+type NormalizedMaskingConfig = {
+    replacement: any;
+    rules: NormalizedMaskRule[];
+};
+
+type MaskRequestContext = {
+    method: string;
+    path: string;
+    key: string;
+};
+
+function normalizeMaskTargets(target: ReproMaskTarget | ReproMaskTarget[]): ReproMaskTarget[] {
+    const out = Array.isArray(target) ? target : [target];
+    return out.filter((t): t is ReproMaskTarget => typeof t === 'string' && t.length > 0);
+}
+
+function parseMaskPath(raw: string): string[] {
+    if (!raw) return [];
+    let path = String(raw).trim();
+    if (!path) return [];
+    if (path.startsWith('$.')) path = path.slice(2);
+    if (path.startsWith('.')) path = path.slice(1);
+    path = path.replace(/\[(\d+|\*)\]/g, '.$1');
+    return path.split('.').map(s => s.trim()).filter(Boolean);
+}
+
+function normalizeMaskPaths(paths?: string | string[]): string[][] {
+    if (!paths) return [];
+    const list = Array.isArray(paths) ? paths : [paths];
+    return list
+        .map(p => parseMaskPath(p))
+        .filter(parts => parts.length > 0);
+}
+
+function normalizeMaskingConfig(raw?: ReproMaskingConfig): NormalizedMaskingConfig | null {
+    const rules = raw?.rules;
+    if (!Array.isArray(rules) || rules.length === 0) return null;
+    const replacement = raw?.replacement ?? DEFAULT_MASK_REPLACEMENT;
+    const normalized: NormalizedMaskRule[] = [];
+    for (const rule of rules) {
+        if (!rule) continue;
+        const targets = normalizeMaskTargets(rule.target);
+        if (!targets.length) continue;
+        const paths = normalizeMaskPaths(rule.paths);
+        const keys = rule.keys ?? undefined;
+        if (!paths.length && !keys) continue;
+        normalized.push({
+            when: rule.when,
+            targets,
+            paths,
+            keys,
+            replacement: rule.replacement ?? replacement,
+        });
+    }
+    return normalized.length ? { replacement, rules: normalized } : null;
+}
+
+function maskWhenRequiresTrace(when: ReproMaskWhen): boolean {
+    return Boolean(
+        when.fn ||
+        when.functionName ||
+        when.wrapper ||
+        when.wrapperClass ||
+        when.className ||
+        when.owner ||
+        when.file ||
+        when.lib ||
+        when.library ||
+        when.type ||
+        when.functionType ||
+        when.event ||
+        when.eventType
+    );
+}
+
+function matchesMaskWhen(when: ReproMaskWhen | undefined, req: MaskRequestContext, trace: TraceEventForFilter | null): boolean {
+    if (!when) return true;
+    if (!matchesPattern(req.method, when.method)) return false;
+    if (!matchesPattern(req.path, when.path)) return false;
+    if (!matchesPattern(req.key, when.key)) return false;
+
+    if (maskWhenRequiresTrace(when)) {
+        if (!trace) return false;
+        if (!matchesRule(when, trace)) return false;
+    }
+
+    return true;
+}
+
+function maskKeysInPlace(node: any, keys: TraceRulePattern, replacement: any) {
+    if (!node) return;
+    if (Array.isArray(node)) {
+        node.forEach(item => maskKeysInPlace(item, keys, replacement));
+        return;
+    }
+    if (typeof node !== 'object') return;
+    Object.keys(node).forEach((key) => {
+        if (matchesPattern(key, keys, false)) {
+            try { node[key] = replacement; } catch {}
+            return;
+        }
+        maskKeysInPlace(node[key], keys, replacement);
+    });
+}
+
+function maskPathInPlace(node: any, pathParts: string[], replacement: any, depth: number = 0) {
+    if (!node) return;
+    if (depth >= pathParts.length) return;
+    const part = pathParts[depth];
+    const isLast = depth === pathParts.length - 1;
+
+    const applyAt = (container: any, key: string | number) => {
+        if (!container) return;
+        try { container[key] = replacement; } catch {}
+    };
+
+    if (part === '*') {
+        if (Array.isArray(node)) {
+            for (let i = 0; i < node.length; i++) {
+                if (isLast) applyAt(node, i);
+                else maskPathInPlace(node[i], pathParts, replacement, depth + 1);
+            }
+        } else if (typeof node === 'object') {
+            for (const key of Object.keys(node)) {
+                if (isLast) applyAt(node, key);
+                else maskPathInPlace(node[key], pathParts, replacement, depth + 1);
+            }
+        }
+        return;
+    }
+
+    const index = Number(part);
+    const isIndex = Number.isInteger(index) && String(index) === part;
+    if (Array.isArray(node) && isIndex) {
+        if (index < 0 || index >= node.length) return;
+        if (isLast) applyAt(node, index);
+        else maskPathInPlace(node[index], pathParts, replacement, depth + 1);
+        return;
+    }
+
+    if (typeof node !== 'object') return;
+    if (!Object.prototype.hasOwnProperty.call(node, part)) return;
+    if (isLast) applyAt(node, part);
+    else maskPathInPlace(node[part], pathParts, replacement, depth + 1);
+}
+
+function applyMasking(
+    target: ReproMaskTarget,
+    value: any,
+    req: MaskRequestContext,
+    trace: TraceEventForFilter | null,
+    masking: NormalizedMaskingConfig | null
+) {
+    if (!masking || !masking.rules.length) return value;
+    if (value === undefined) return value;
+    for (const rule of masking.rules) {
+        if (!rule.targets.includes(target)) continue;
+        if (!matchesMaskWhen(rule.when, req, trace)) continue;
+        const replacement = rule.replacement ?? masking.replacement ?? DEFAULT_MASK_REPLACEMENT;
+        if (rule.keys) maskKeysInPlace(value, rule.keys, replacement);
+        if (rule.paths.length) {
+            rule.paths.forEach(parts => maskPathInPlace(value, parts, replacement, 0));
+        }
+    }
+    return value;
 }
 
 // ===================================================================
@@ -1492,11 +1761,14 @@ export type ReproMiddlewareConfig = {
     tenantId: string;
     appSecret: string;
     apiBase: string;
-    /** Configure header capture/redaction. Defaults to capturing with sensitive headers removed. */
+    /** Configure header capture/masking. Defaults to capturing with sensitive headers masked. */
     captureHeaders?: boolean | HeaderCaptureOptions;
+    /** Optional masking rules for request/response payloads and function traces. */
+    masking?: ReproMaskingConfig;
 };
 
 export function reproMiddleware(cfg: ReproMiddlewareConfig) {
+    const masking = normalizeMaskingConfig(cfg.masking);
     return function (req: Request, res: Response, next: NextFunction) {
         const sid = (req.headers['x-bug-session-id'] as string) || '';
         const aid = (req.headers['x-bug-action-id'] as string) || '';
@@ -1509,8 +1781,10 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
         const rid = nextRequestId(requestEpochMs);
         const t0 = requestStartRaw;
         const url = (req as any).originalUrl || req.url || '/';
+        const urlPathOnly = (url || '/').split('?')[0] || '/';
         const path = url; // back-compat
         const key = normalizeRouteKey(req.method, url);
+        const maskReq: MaskRequestContext = { method: String(req.method || 'GET').toUpperCase(), path: urlPathOnly, key };
         const requestHeaders = sanitizeHeaders(req.headers, cfg.captureHeaders);
         beginSessionRequest(sid);
 
@@ -1651,14 +1925,43 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 evt.functionType = ev.functionType;
                             }
 
+                            const candidate: TraceEventForFilter = {
+                                type: evt.type,
+                                eventType: evt.type,
+                                functionType: evt.functionType ?? null,
+                                fn: evt.fn,
+                                wrapperClass: inferWrapperClassFromFn(evt.fn),
+                                file: evt.file ?? null,
+                                depth: evt.depth,
+                                library: inferLibraryNameFromFile(evt.file),
+                            };
+
                             if (ev.args !== undefined) {
-                                evt.args = sanitizeTraceArgs(ev.args);
+                                evt.args = applyMasking(
+                                    'trace.args',
+                                    sanitizeTraceArgs(ev.args),
+                                    maskReq,
+                                    candidate,
+                                    masking
+                                );
                             }
                             if (ev.returnValue !== undefined) {
-                                evt.returnValue = sanitizeTraceValue(ev.returnValue);
+                                evt.returnValue = applyMasking(
+                                    'trace.returnValue',
+                                    sanitizeTraceValue(ev.returnValue),
+                                    maskReq,
+                                    candidate,
+                                    masking
+                                );
                             }
                             if (ev.error !== undefined) {
-                                evt.error = sanitizeTraceValue(ev.error);
+                                evt.error = applyMasking(
+                                    'trace.error',
+                                    sanitizeTraceValue(ev.error),
+                                    maskReq,
+                                    candidate,
+                                    masking
+                                );
                             }
                             if (ev.threw !== undefined) {
                                 evt.threw = Boolean(ev.threw);
@@ -1666,16 +1969,6 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             if (ev.unawaited !== undefined) {
                                 evt.unawaited = ev.unawaited === true;
                             }
-
-                            const candidate: TraceEventForFilter = {
-                                type: evt.type,
-                                eventType: evt.type,
-                                functionType: evt.functionType ?? null,
-                                fn: evt.fn,
-                                file: evt.file ?? null,
-                                depth: evt.depth,
-                                library: inferLibraryNameFromFile(evt.file),
-                            };
 
                             const dropEvent = shouldDropTraceEvent(candidate);
                             const spanKey = normalizeSpanId(evt.spanId);
@@ -1759,9 +2052,54 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             ?? firstAppTrace
                             ?? { fn: null, file: null, line: null, functionType: null };
                         const traceBatches = chunkArray(orderedEvents, TRACE_BATCH_SIZE);
-                        const requestBody = sanitizeRequestSnapshot((req as any).body);
-                        const requestParams = sanitizeRequestSnapshot((req as any).params);
-                        const requestQuery = sanitizeRequestSnapshot((req as any).query);
+                        const endpointTraceCtx: TraceEventForFilter | null = (() => {
+                            if (!chosenEndpoint?.fn && !chosenEndpoint?.file) return null;
+                            return {
+                                type: 'enter',
+                                eventType: 'enter',
+                                fn: chosenEndpoint.fn ?? undefined,
+                                wrapperClass: inferWrapperClassFromFn(chosenEndpoint.fn),
+                                file: chosenEndpoint.file ?? null,
+                                functionType: chosenEndpoint.functionType ?? null,
+                                library: inferLibraryNameFromFile(chosenEndpoint.file),
+                            };
+                        })();
+
+                        const requestBody = applyMasking(
+                            'request.body',
+                            sanitizeRequestSnapshot((req as any).body),
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
+                        const requestParams = applyMasking(
+                            'request.params',
+                            sanitizeRequestSnapshot((req as any).params),
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
+                        const requestQuery = applyMasking(
+                            'request.query',
+                            sanitizeRequestSnapshot((req as any).query),
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
+                        const maskedHeaders = applyMasking(
+                            'request.headers',
+                            requestHeaders,
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
+                        const responseBody = applyMasking(
+                            'response.body',
+                            capturedBody === undefined ? undefined : sanitizeRequestSnapshot(capturedBody),
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
 
                         const requestPayload: Record<string, any> = {
                             rid,
@@ -1770,9 +2108,9 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             path,
                             status: res.statusCode,
                             durMs: Date.now() - t0,
-                            headers: requestHeaders,
+                            headers: maskedHeaders,
                             key,
-                            respBody: capturedBody,
+                            respBody: responseBody,
                             trace: traceBatches.length ? undefined : '[]',
                         };
                         if (requestBody !== undefined) requestPayload.body = requestBody;
