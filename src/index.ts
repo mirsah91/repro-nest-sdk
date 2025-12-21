@@ -229,7 +229,7 @@ let __TRACER__: TracerApi | null = null;
 let __TRACER_READY = false;
 
 type TraceEventPhase = 'enter' | 'exit';
-export type TraceRulePattern = string | RegExp | Array<string | RegExp>;
+export type TraceRulePattern = string | number | RegExp | Array<string | number | RegExp>;
 
 export type TraceEventForFilter = {
     type: TraceEventPhase; // legacy alias for eventType
@@ -238,6 +238,7 @@ export type TraceEventForFilter = {
     fn?: string;
     wrapperClass?: string | null;
     file?: string | null;
+    line?: number | null;
     depth?: number;
     library?: string | null;
 };
@@ -323,8 +324,10 @@ export type DisableFunctionTraceRule = {
     className?: TraceRulePattern;
     /** Alias for {@link wrapperClass}. */
     owner?: TraceRulePattern;
-    /** Absolute file path where the function was defined. */
+    /** Source filename reported by the trace event. */
     file?: TraceRulePattern;
+    /** Line number reported by the trace event. */
+    line?: TraceRulePattern;
     /** Shortcut for {@link library}. */
     lib?: TraceRulePattern;
     /** Library/package name inferred from the file path (e.g. `"mongoose"`). */
@@ -409,8 +412,8 @@ function refreshDisabledFunctionTraceRules() {
 }
 
 let disabledFunctionTraceRules: DisableFunctionTraceConfig[] = computeDisabledFunctionTraceRules();
-let disabledFunctionTypePatterns: Array<string | RegExp> = [];
-let disabledTraceFilePatterns: Array<string | RegExp> = [];
+let disabledFunctionTypePatterns: Array<string | number | RegExp> = [];
+let disabledTraceFilePatterns: Array<string | number | RegExp> = [];
 let __TRACE_LOG_PREF: boolean | null = null;
 
 function setInterceptorTracingEnabled(enabled: boolean) {
@@ -489,6 +492,7 @@ function matchesRule(rule: DisableFunctionTraceRule, event: TraceEventForFilter)
     if (!matchesPattern(event.wrapperClass, wrapperPattern)) return false;
 
     if (!matchesPattern(event.file, rule.file)) return false;
+    if (!matchesPattern(event.line == null ? null : String(event.line), rule.line)) return false;
 
     const libPattern = rule.lib ?? rule.library;
     if (!matchesPattern(event.library, libPattern)) return false;
@@ -541,12 +545,12 @@ export function setDisabledFunctionTypes(patterns?: TraceRulePattern | null) {
     disabledFunctionTypePatterns = normalizePatternArray(patterns);
 }
 
-function flattenTraceFilePatterns(config: DisableTraceFileConfig): Array<string | RegExp> {
+function flattenTraceFilePatterns(config: DisableTraceFileConfig): Array<string | number | RegExp> {
     if (config === null || config === undefined) return [];
     if (Array.isArray(config)) {
         return config.flatMap(entry => flattenTraceFilePatterns(entry));
     }
-    if (config instanceof RegExp || typeof config === 'string') {
+    if (config instanceof RegExp || typeof config === 'string' || typeof config === 'number') {
         return [config];
     }
     if (typeof config === 'object' && 'file' in config) {
@@ -1910,6 +1914,10 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                         unsubscribe = __TRACER__.tracer.on((ev: any) => {
                             if (!ev || ev.traceId !== tidNow) return;
 
+                            const sourceFileForLibrary = typeof ev.sourceFile === 'string' && ev.sourceFile
+                                ? String(ev.sourceFile)
+                                : null;
+
                             const evt: TraceEventRecord = {
                                 t: alignTimestamp(ev.t),
                                 type: ev.type,
@@ -1932,8 +1940,9 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 fn: evt.fn,
                                 wrapperClass: inferWrapperClassFromFn(evt.fn),
                                 file: evt.file ?? null,
+                                line: evt.line ?? null,
                                 depth: evt.depth,
-                                library: inferLibraryNameFromFile(evt.file),
+                                library: inferLibraryNameFromFile(sourceFileForLibrary ?? evt.file),
                             };
 
                             if (ev.args !== undefined) {
@@ -2060,6 +2069,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 fn: chosenEndpoint.fn ?? undefined,
                                 wrapperClass: inferWrapperClassFromFn(chosenEndpoint.fn),
                                 file: chosenEndpoint.file ?? null,
+                                line: chosenEndpoint.line ?? null,
                                 functionType: chosenEndpoint.functionType ?? null,
                                 library: inferLibraryNameFromFile(chosenEndpoint.file),
                             };

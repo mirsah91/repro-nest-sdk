@@ -128,6 +128,7 @@ const trace = {
             fn,
             file: meta?.file,
             line: meta?.line,
+            sourceFile: meta?.sourceFile || null,
             functionType: meta?.functionType || null,
             traceId: ctx.traceId,
             depth: ctx.depth,
@@ -144,6 +145,7 @@ const trace = {
             fn: meta?.fn,
             file: meta?.file,
             line: meta?.line,
+            sourceFile: meta?.sourceFile || null,
             functionType: meta?.functionType || null
         };
         const frameStack = ctx.__repro_frame_unawaited;
@@ -190,6 +192,7 @@ const trace = {
                 fn: baseMeta.fn,
                 file: baseMeta.file,
                 line: baseMeta.line,
+                sourceFile: baseMeta.sourceFile,
                 functionType: baseMeta.functionType || null,
                 traceId: traceIdAtExit,
                 depth: spanInfo.depth ?? depthAtExit,
@@ -601,10 +604,14 @@ if (!global.__repro_call) {
                     const name = (label && label.length) || fn.name
                         ? (label && label.length ? label : fn.name)
                         : '(anonymous)';
-                    const sourceFile = fn[SYM_SRC_FILE];
+                    const definitionFile = fn[SYM_SRC_FILE];
+                    const normalizedCallFile = callFile ? String(callFile).trim() : '';
+                    const callsiteFile = normalizedCallFile ? normalizedCallFile : null;
+                    const callsiteLine = Number.isFinite(Number(callLine)) && Number(callLine) > 0 ? Number(callLine) : null;
                     const meta = {
-                        file: sourceFile || callFile || null,
-                        line: sourceFile ? null : (callLine || null),
+                        file: callsiteFile || definitionFile || null,
+                        line: callsiteLine,
+                        sourceFile: definitionFile || null,
                         parentSpanId: forcedParentSpanId
                     };
 
@@ -638,7 +645,7 @@ if (!global.__repro_call) {
                         })();
 
                         const runExit = (detail) => {
-                            const runner = () => trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
+                            const runner = () => trace.exit({ fn: name, file: meta.file, line: meta.line, sourceFile: meta.sourceFile }, detail);
                             if (exitStore) return als.run(exitStore, runner);
                             return runner();
                         };
@@ -685,7 +692,7 @@ if (!global.__repro_call) {
                         runExit(exitDetailBase);
                         return out;
                     } catch (e) {
-                        trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
+                        trace.exit({ fn: name, file: meta.file, line: meta.line, sourceFile: meta.sourceFile }, { threw: true, error: e, args });
                         throw e;
                     } finally {
                         if (pendingMarker) {

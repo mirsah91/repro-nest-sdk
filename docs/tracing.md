@@ -51,7 +51,8 @@ captured in the session payload.
 | --------------- | ------------------------------------------------------------------------------------------------- |
 | `fn`/`functionName` | Match against the instrumented function name (substring or RegExp).                                |
 | `wrapper`/`wrapperClass`/`className`/`owner` | Match the wrapper/owner inferred from the function name (e.g. `"UserService"` in `"UserService.create"`). |
-| `file`          | Match the absolute source filename, useful for filtering entire modules.                           |
+| `file`          | Match the filename reported by the trace event (callsite for wrapped calls; definition file for body-traced app functions). |
+| `line`          | Match the line number reported by the trace event.                                                  |
 | `lib`/`library` | Match the npm package inferred from the file path (e.g. `"mongoose"`).                              |
 | `type`/`functionType` | Match the detected function kind (e.g. `"constructor"`, `"method"`, `"arrow"`).                |
 | `event`/`eventType` | Match the trace phase (`"enter"` or `"exit"`) to suppress only specific edges of a call.          |
@@ -94,7 +95,7 @@ function inputs/outputs before they are persisted.
 ### Rules
 
 - `when.method` / `when.path` / `when.key` scope rules by endpoint (`key` is `"METHOD /path"` without query string).
-- For function-specific rules, `when` supports the same fields as `disableFunctionTraces` (`fn`, `wrapperClass`, `file`, etc). This is useful when multiple functions share the same name.
+- For function-specific rules, `when` supports the same fields as `disableFunctionTraces` (`fn`, `wrapperClass`, `file`, `line`, etc). This is useful when multiple functions share the same name.
 - `paths` uses dot/bracket syntax and supports `*`, `[0]`, `[*]` (example: `"items[*].token"` or `"0.password"` for trace args arrays).
 - `keys` masks matching key names anywhere in the payload (string/RegExp/array).
 - `replacement` overrides the default replacement value (defaults to `"[REDACTED]"`).
