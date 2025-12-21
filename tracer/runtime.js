@@ -86,15 +86,15 @@ function pushSpan(ctx, depth, explicitParentId = null) {
     const parent = explicitParentId !== null && explicitParentId !== undefined
         ? { id: explicitParentId, parentId: null }
         : (stack.length ? stack[stack.length - 1] : null);
-    const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null, depth };
+    const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null, depth, file: null, line: null, sourceFile: null };
     stack.push(span);
     return span;
 }
 
 function popSpan(ctx) {
     const stack = ctx.__repro_span_stack;
-    if (!Array.isArray(stack) || !stack.length) return { id: null, parentId: null, depth: null };
-    return stack.pop() || { id: null, parentId: null, depth: null };
+    if (!Array.isArray(stack) || !stack.length) return { id: null, parentId: null, depth: null, file: null, line: null, sourceFile: null };
+    return stack.pop() || { id: null, parentId: null, depth: null, file: null, line: null, sourceFile: null };
 }
 
 const trace = {
@@ -120,15 +120,36 @@ const trace = {
         }
         frameStack.push(frameUnawaited);
 
+        const fallbackDefinitionFile = meta?.file || null;
+        let file = meta?.file || null;
+        let line = meta?.line || null;
+        let sourceFile = meta?.sourceFile || null;
+        try {
+            const queue = ctx.__repro_callsite_queue;
+            if (Array.isArray(queue) && queue.length) {
+                const override = queue.shift();
+                if (override && (override.file || override.line !== null && override.line !== undefined)) {
+                    if (!sourceFile && fallbackDefinitionFile) sourceFile = fallbackDefinitionFile;
+                    if (override.file) file = override.file;
+                    if (override.line !== null && override.line !== undefined) line = override.line;
+                }
+            }
+        } catch {}
+
         const span = pushSpan(ctx, ctx.depth, parentSpanIdOverride);
+        try {
+            span.file = file;
+            span.line = line;
+            span.sourceFile = sourceFile;
+        } catch {}
 
         emit({
             type: 'enter',
             t: Date.now(),
             fn,
-            file: meta?.file,
-            line: meta?.line,
-            sourceFile: meta?.sourceFile || null,
+            file,
+            line,
+            sourceFile,
             functionType: meta?.functionType || null,
             traceId: ctx.traceId,
             depth: ctx.depth,
@@ -155,7 +176,7 @@ const trace = {
         const spanStackRef = Array.isArray(ctx.__repro_span_stack) ? ctx.__repro_span_stack : [];
         const spanInfoPeek = spanStackRef.length
             ? spanStackRef[spanStackRef.length - 1]
-            : { id: null, parentId: null, depth: depthAtExit };
+            : { id: null, parentId: null, depth: depthAtExit, file: baseMeta.file, line: baseMeta.line, sourceFile: baseMeta.sourceFile };
         const baseDetail = {
             args: detail?.args,
             returnValue: detail?.returnValue,
@@ -190,9 +211,9 @@ const trace = {
                 type: 'exit',
                 t: Date.now(),
                 fn: baseMeta.fn,
-                file: baseMeta.file,
-                line: baseMeta.line,
-                sourceFile: baseMeta.sourceFile,
+                file: spanInfo.file !== null && spanInfo.file !== undefined ? spanInfo.file : baseMeta.file,
+                line: spanInfo.line !== null && spanInfo.line !== undefined ? spanInfo.line : baseMeta.line,
+                sourceFile: spanInfo.sourceFile !== null && spanInfo.sourceFile !== undefined ? spanInfo.sourceFile : baseMeta.sourceFile,
                 functionType: baseMeta.functionType || null,
                 traceId: traceIdAtExit,
                 depth: spanInfo.depth ?? depthAtExit,
@@ -720,14 +741,22 @@ if (!global.__repro_call) {
                         const isolatedStore = isUnawaitedCall
                             ? (forkAlsStoreForUnawaited(callStoreForArgs || ctx) || cloneStore(callStoreForArgs || ctx))
                             : null;
-                        try {
-                            const shouldWrap = !isAsyncLocalContextSetter(fn, thisArg);
-                            const argsForCall = shouldWrap ? wrapArgsWithStore(args, callStoreForArgs || ctx) : args;
-                            let out;
-                            if (isolatedStore) {
-                                als.run(isolatedStore, () => {
-                                    out = fn.apply(thisArg, argsForCall);
-                                });
+	                        try {
+	                            const shouldWrap = !isAsyncLocalContextSetter(fn, thisArg);
+	                            const argsForCall = shouldWrap ? wrapArgsWithStore(args, callStoreForArgs || ctx) : args;
+	                            const normalizedCallFile = callFile ? String(callFile).trim() : '';
+	                            const callsiteFile = normalizedCallFile ? normalizedCallFile : null;
+	                            const callsiteLine = Number.isFinite(Number(callLine)) && Number(callLine) > 0 ? Number(callLine) : null;
+	                            const callsiteStore = isolatedStore || ctx;
+	                            if (callsiteStore && (callsiteFile || callsiteLine !== null)) {
+	                                const queue = callsiteStore.__repro_callsite_queue || (callsiteStore.__repro_callsite_queue = []);
+	                                queue.push({ file: callsiteFile, line: callsiteLine });
+	                            }
+	                            let out;
+	                            if (isolatedStore) {
+	                                als.run(isolatedStore, () => {
+	                                    out = fn.apply(thisArg, argsForCall);
+	                                });
                             } else {
                                 out = fn.apply(thisArg, argsForCall);
                             }

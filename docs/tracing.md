@@ -51,7 +51,7 @@ captured in the session payload.
 | --------------- | ------------------------------------------------------------------------------------------------- |
 | `fn`/`functionName` | Match against the instrumented function name (substring or RegExp).                                |
 | `wrapper`/`wrapperClass`/`className`/`owner` | Match the wrapper/owner inferred from the function name (e.g. `"UserService"` in `"UserService.create"`). |
-| `file`          | Match the filename reported by the trace event (callsite for wrapped calls; definition file for body-traced app functions). |
+| `file`          | Match the filename reported by the trace event (callsite when available; may fall back to the function definition file when the caller is not instrumented). |
 | `line`          | Match the line number reported by the trace event.                                                  |
 | `lib`/`library` | Match the npm package inferred from the file path (e.g. `"mongoose"`).                              |
 | `type`/`functionType` | Match the detected function kind (e.g. `"constructor"`, `"method"`, `"arrow"`).                |
