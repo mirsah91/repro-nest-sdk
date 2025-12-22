@@ -107,7 +107,6 @@ app.use(reproMiddleware({
   appId,
   tenantId,
   appSecret,
-  apiBase,
   masking: {
     rules: [
       {

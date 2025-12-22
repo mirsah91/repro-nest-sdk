@@ -1101,21 +1101,21 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
 }
 
 async function post(
-    apiBase: string,
-    tenantId: string,
-    appId: string,
-    appSecret: string,
+    cfg: { tenantId: string; appId: string; appSecret: string; apiBase?: string },
     sessionId: string,
     body: any,
 ) {
     try {
+        const envBase = typeof process !== 'undefined' ? (process as any)?.env?.REPRO_API_BASE : undefined;
+        const legacyBase = (cfg as any)?.apiBase;
+        const apiBase = String(envBase || legacyBase || 'https://api.repro.ai').replace(/\/+$/, '');
         await fetch(`${apiBase}/v1/sessions/${sessionId}/backend`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'X-App-Id': appId,
-                'X-App-Secret': appSecret,
-                'X-Tenant-Id': tenantId,
+                'X-App-Id': cfg.appId,
+                'X-App-Secret': cfg.appSecret,
+                'X-Tenant-Id': cfg.tenantId,
             },
             body: JSON.stringify(body),
         });
@@ -1764,7 +1764,6 @@ export type ReproMiddlewareConfig = {
     appId: string;
     tenantId: string;
     appSecret: string;
-    apiBase: string;
     /** Configure header capture/masking. Defaults to capturing with sensitive headers masked. */
     captureHeaders?: boolean | HeaderCaptureOptions;
     /** Optional masking rules for request/response payloads and function traces. */
@@ -1820,7 +1819,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             return fn();
         };
 
-        runInTrace(() => als.run({ sid, aid, clockSkewMs, excludedSpanIds: new Set<string>() }, () => {
+	        runInTrace(() => als.run({ sid, aid, clockSkewMs, excludedSpanIds: new Set<string>() }, () => {
             const events: TraceEventRecord[] = [];
             let endpointTrace: EndpointTraceInfo | null = null;
             let preferredAppTrace: EndpointTraceInfo | null = null;
@@ -1831,12 +1830,12 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let finishedAt: number | null = null;
             let lastEventAt: number = Date.now();
             let idleTimer: NodeJS.Timeout | null = null;
-            let hardStopTimer: NodeJS.Timeout | null = null;
+	            let hardStopTimer: NodeJS.Timeout | null = null;
             let drainTimer: NodeJS.Timeout | null = null;
             let flushPayload: null | (() => void) = null;
             const activeSpans = new Set<string>();
             let anonymousSpanDepth = 0;
-            const ACTIVE_SPAN_FORCE_FLUSH_MS = 30000; // safety guard against leaks
+	            const ACTIVE_SPAN_FORCE_FLUSH_MS = 60000; // hard cutoff after finish to avoid endlessly running replies
 
             const clearTimers = () => {
                 if (idleTimer) {
@@ -1864,12 +1863,12 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 idleTimer = setTimeout(() => doFlush(false), delay);
             };
 
-            const doFlush = (force: boolean = false) => {
-                if (flushed) return;
-                const now = Date.now();
-                const stillActive = hasActiveWork();
-                const quietMs = now - lastEventAt;
-                const waitedFinish = finishedAt === null ? 0 : now - finishedAt;
+	            const doFlush = (force: boolean = false) => {
+	                if (flushed) return;
+	                const now = Date.now();
+	                const stillActive = hasActiveWork();
+	                const quietMs = now - lastEventAt;
+	                const waitedFinish = finishedAt === null ? 0 : now - finishedAt;
 
                 // If work is still active and we haven't been quiet long enough, defer.
                 if (stillActive && !force) {
@@ -1877,17 +1876,20 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                     scheduleIdleFlush(Math.max(remaining, 10));
                     return;
                 }
-                if (stillActive && force) {
-                    // Allow forced flush after either linger window of silence or max guard.
-                    if (quietMs < TRACE_LINGER_AFTER_FINISH_MS && waitedFinish < ACTIVE_SPAN_FORCE_FLUSH_MS) {
-                        const remainingQuiet = TRACE_LINGER_AFTER_FINISH_MS - quietMs;
-                        const remainingGuard = ACTIVE_SPAN_FORCE_FLUSH_MS - waitedFinish;
-                        scheduleIdleFlush(Math.max(10, Math.min(remainingQuiet, remainingGuard)));
-                        return;
-                    }
-                }
-                flushed = true;
-                clearTimers();
+	                if (stillActive && force) {
+	                    // Allow forced flush after either linger window of silence or max guard.
+	                    if (quietMs < TRACE_LINGER_AFTER_FINISH_MS && waitedFinish < ACTIVE_SPAN_FORCE_FLUSH_MS) {
+	                        const remainingQuiet = TRACE_LINGER_AFTER_FINISH_MS - quietMs;
+	                        const remainingGuard = ACTIVE_SPAN_FORCE_FLUSH_MS - waitedFinish;
+	                        if (hardStopTimer) {
+	                            try { clearTimeout(hardStopTimer); } catch {}
+	                        }
+	                        hardStopTimer = setTimeout(() => doFlush(true), Math.max(10, Math.min(remainingQuiet, remainingGuard)));
+	                        return;
+	                    }
+	                }
+	                flushed = true;
+	                clearTimers();
                 try { unsubscribe && unsubscribe(); } catch {}
                 try { flushPayload?.(); } catch {}
             };
@@ -2128,13 +2130,13 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                         if (requestQuery !== undefined) requestPayload.query = requestQuery;
                         requestPayload.entryPoint = chosenEndpoint;
 
-                        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-                            entries: [{
-                                actionId: aid,
-                                request: requestPayload,
-                                t: alignedNow(),
-                            }]
-                        });
+	                        post(cfg, sid, {
+	                            entries: [{
+	                                actionId: aid,
+	                                request: requestPayload,
+	                                t: alignedNow(),
+	                            }]
+	                        });
 
                         if (traceBatches.length) {
                             for (let i = 0; i < traceBatches.length; i++) {
@@ -2142,12 +2144,12 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 let traceStr = '[]';
                                 try { traceStr = JSON.stringify(batch); } catch {}
 
-                                post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-                                    entries: [{
-                                        actionId: aid,
-                                        trace: traceStr,
-                                        traceBatch: {
-                                            rid,
+	                                post(cfg, sid, {
+	                                    entries: [{
+	                                        actionId: aid,
+	                                        trace: traceStr,
+	                                        traceBatch: {
+	                                            rid,
                                             index: i,
                                             total: traceBatches.length,
                                         },
@@ -2200,7 +2202,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 //   - ONLY schema middleware (pre/post) for specific ops
 //   - keeps your existing doc-diff hooks
 // ===================================================================
-export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appSecret: string; apiBase: string }) {
+export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appSecret: string }) {
     return function (schema: Schema) {
         // -------- pre/post save (unchanged) --------
         schema.pre('save', { document: true }, async function (next) {
@@ -2240,11 +2242,11 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 ? { op: 'insertOne', doc: after }
                 : { filter: { _id: this._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
 
-            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
-                entries: [{
-                    actionId: (getCtx() as Ctx).aid!,
-                    db: [attachSpanContext({
-                        collection,
+	            post(cfg, (getCtx() as Ctx).sid!, {
+	                entries: [{
+	                    actionId: (getCtx() as Ctx).aid!,
+	                    db: [attachSpanContext({
+	                        collection,
                         pk: { _id: (this as any)._id },
                         before,
                         after,
@@ -2282,11 +2284,11 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             if (!shouldCaptureDbSpan(spanContext)) return;
             const pk = after?._id ?? before?._id;
 
-            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
-                entries: [{
-                    actionId: (getCtx() as Ctx).aid!,
-                    db: [attachSpanContext({
-                        collection,
+	            post(cfg, (getCtx() as Ctx).sid!, {
+	                entries: [{
+	                    actionId: (getCtx() as Ctx).aid!,
+	                    db: [attachSpanContext({
+	                        collection,
                         pk: { _id: pk },
                         before,
                         after,
@@ -2318,11 +2320,11 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const filter = (this as any).__repro_filter ?? { _id: before._id };
             const spanContext = (this as any).__repro_spanContext || captureSpanContextFromTracer(this);
             if (!shouldCaptureDbSpan(spanContext)) return;
-            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
-                entries: [{
-                    actionId: (getCtx() as Ctx).aid!,
-                    db: [attachSpanContext({
-                        collection,
+	            post(cfg, (getCtx() as Ctx).sid!, {
+	                entries: [{
+	                    actionId: (getCtx() as Ctx).aid!,
+	                    db: [attachSpanContext({
+	                        collection,
                         pk: { _id: before._id },
                         before,
                         after: null,
@@ -2644,11 +2646,11 @@ function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
         pk: null, before: null, after: null,
         error: payload.error ?? undefined,
     }, spanContext);
-    post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-        entries: [{
-            actionId: aid ?? null,
-            db: [dbEntry],
-            t: payload.t,
+	    post(cfg, sid, {
+	        entries: [{
+	            actionId: aid ?? null,
+	            db: [dbEntry],
+	            t: payload.t,
         }]
     });
 }
@@ -2697,7 +2699,6 @@ export type SendgridPatchConfig = {
     appId: string;
     tenantId: string;
     appSecret: string;
-    apiBase: string;
     resolveContext?: () => { sid?: string; aid?: string } | undefined;
 };
 
@@ -2752,11 +2753,11 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
         if (!sid) return;
 
         const norm = normalizeSendgridMessage(rawMsg);
-        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-            entries: [{
-                actionId: aid ?? null,
-                email: {
-                    provider: 'sendgrid',
+	        post(cfg, sid, {
+	            entries: [{
+	                actionId: aid ?? null,
+	                email: {
+	                    provider: 'sendgrid',
                     kind,
                     to: norm.to, cc: norm.cc, bcc: norm.bcc, from: norm.from,
                     subject: norm.subject, text: norm.text, html: norm.html,

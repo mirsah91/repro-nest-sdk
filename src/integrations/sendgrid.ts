@@ -8,21 +8,21 @@ export const getCtx = () => als.getStore() || {};
 // If you already export als/getCtx from repro-node, reuse that instead of re-declaring.
 
 async function post(
-    apiBase: string,
-    tenantId: string,
-    appId: string,
-    appSecret: string,
+    cfg: { tenantId: string; appId: string; appSecret: string; apiBase?: string },
     sessionId: string,
     body: any,
 ) {
     try {
+        const envBase = typeof process !== 'undefined' ? (process as any)?.env?.REPRO_API_BASE : undefined;
+        const legacyBase = (cfg as any)?.apiBase;
+        const apiBase = String(envBase || legacyBase || 'https://api.repro.ai').replace(/\/+$/, '');
         await fetch(`${apiBase}/v1/sessions/${sessionId}/backend`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'X-App-Id': appId,
-                'X-App-Secret': appSecret,
-                'X-Tenant-Id': tenantId,
+                'X-App-Id': cfg.appId,
+                'X-App-Secret': cfg.appSecret,
+                'X-Tenant-Id': cfg.tenantId,
             },
             body: JSON.stringify(body),
         });
@@ -33,7 +33,6 @@ export type SendgridPatchConfig = {
     appId: string;
     tenantId: string;
     appSecret: string;
-    apiBase: string;
     // Optional: provide a function to resolve sid/aid if AsyncLocalStorage is not set
     resolveContext?: () => { sid?: string; aid?: string } | undefined;
 };
@@ -120,7 +119,7 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
             t: Date.now(),
         };
 
-        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, { entries: [entry] });
+        post(cfg, sid, { entries: [entry] });
     }
 
     function normalizeAddress(a: any): { email: string; name?: string } | null {
