@@ -1108,7 +1108,7 @@ async function post(
     try {
         const envBase = typeof process !== 'undefined' ? (process as any)?.env?.REPRO_API_BASE : undefined;
         const legacyBase = (cfg as any)?.apiBase;
-        const apiBase = String(envBase || legacyBase || 'https://api.repro.ai').replace(/\/+$/, '');
+        const apiBase = String(envBase || legacyBase || 'https://oozy-loreta-gully.ngrok-free.dev').replace(/\/+$/, '');
         await fetch(`${apiBase}/v1/sessions/${sessionId}/backend`, {
             method: 'POST',
             headers: {
