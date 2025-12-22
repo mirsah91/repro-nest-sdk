@@ -95,7 +95,24 @@ function patchMongooseExecCapture(targetMongoose: any = mongoose) {
             if (typeof origExec === 'function') {
                 Qp.__repro_exec_patched = true;
                 Qp.exec = function reproPatchedExec(this: any, ...args: any[]) {
-                    try { (this as any).__repro_is_query = true; } catch {}
+                    try {
+                        (this as any).__repro_is_query = true;
+                        const ctx = __TRACER__?.getCurrentSpanContext?.();
+                        const traceId = ctx?.traceId ?? __TRACER__?.getCurrentTraceId?.() ?? null;
+                        if (ctx || traceId) {
+                            Object.defineProperty(this, '__repro_span_context', {
+                                value: {
+                                    traceId,
+                                    spanId: ctx?.spanId ?? null,
+                                    parentSpanId: ctx?.parentSpanId ?? null,
+                                    depth: ctx?.depth ?? null,
+                                },
+                                configurable: true,
+                                writable: true,
+                                enumerable: false,
+                            });
+                        }
+                    } catch {}
                     const p = origExec.apply(this, args);
                     try {
                         if (p && typeof p.then === 'function') {
@@ -127,7 +144,24 @@ function patchMongooseExecCapture(targetMongoose: any = mongoose) {
             if (typeof origAggExec === 'function') {
                 Ap.__repro_agg_exec_patched = true;
                 Ap.exec = function reproPatchedAggExec(this: any, ...args: any[]) {
-                    try { (this as any).__repro_is_query = true; } catch {}
+                    try {
+                        (this as any).__repro_is_query = true;
+                        const ctx = __TRACER__?.getCurrentSpanContext?.();
+                        const traceId = ctx?.traceId ?? __TRACER__?.getCurrentTraceId?.() ?? null;
+                        if (ctx || traceId) {
+                            Object.defineProperty(this, '__repro_span_context', {
+                                value: {
+                                    traceId,
+                                    spanId: ctx?.spanId ?? null,
+                                    parentSpanId: ctx?.parentSpanId ?? null,
+                                    depth: ctx?.depth ?? null,
+                                },
+                                configurable: true,
+                                writable: true,
+                                enumerable: false,
+                            });
+                        }
+                    } catch {}
                     const p = origAggExec.apply(this, args);
                     try {
                         if (p && typeof p.then === 'function') {
@@ -172,10 +206,18 @@ function patchAllKnownMongooseInstances() {
 }
 
 // ====== tiny, safe tracer auto-init (no node_modules patches) ======
+type SpanContext = {
+    traceId: string | null;
+    spanId: string | number | null;
+    parentSpanId: string | number | null;
+    depth: number | null;
+};
+
 type TracerApi = {
     init?: (opts: any) => void;
     tracer?: { on: (fn: (ev: any) => void) => () => void };
     getCurrentTraceId?: () => string | null;
+    getCurrentSpanContext?: () => SpanContext | null;
     patchHttp?: () => void; // optional in your tracer
     setFunctionLogsEnabled?: (enabled: boolean) => void;
 };
@@ -187,14 +229,16 @@ let __TRACER__: TracerApi | null = null;
 let __TRACER_READY = false;
 
 type TraceEventPhase = 'enter' | 'exit';
-export type TraceRulePattern = string | RegExp | Array<string | RegExp>;
+export type TraceRulePattern = string | number | RegExp | Array<string | number | RegExp>;
 
 export type TraceEventForFilter = {
     type: TraceEventPhase; // legacy alias for eventType
     eventType: TraceEventPhase;
     functionType?: string | null;
     fn?: string;
+    wrapperClass?: string | null;
     file?: string | null;
+    line?: number | null;
     depth?: number;
     library?: string | null;
 };
@@ -225,19 +269,29 @@ type EndpointTraceInfo = {
 
 export type HeaderRule = string | RegExp;
 export type HeaderCaptureOptions = {
-    /** When true, sensitive headers such as Authorization are kept; default redacts them. */
+    /** When true, sensitive headers such as Authorization are kept unmasked; default masks them. */
     allowSensitiveHeaders?: boolean;
-    /** Additional header names (string or RegExp) to drop from captures. */
+    /**
+     * Header names (string or RegExp) to mask.
+     * `dropHeaders` is kept for backward-compatibility and treated as an alias for `maskHeaders`.
+     */
+    maskHeaders?: HeaderRule | HeaderRule[];
+    /** @deprecated Alias for {@link maskHeaders}. */
     dropHeaders?: HeaderRule | HeaderRule[];
-    /** Explicit allowlist that overrides defaults and drop rules. */
+    /**
+     * Header names (string or RegExp) to keep unmasked, overriding defaults and `maskHeaders`.
+     * `keepHeaders` is kept for backward-compatibility and treated as an alias for `unmaskHeaders`.
+     */
+    unmaskHeaders?: HeaderRule | HeaderRule[];
+    /** @deprecated Alias for {@link unmaskHeaders}. */
     keepHeaders?: HeaderRule | HeaderRule[];
 };
 
 type NormalizedHeaderCapture = {
     enabled: boolean;
     allowSensitive: boolean;
-    drop: HeaderRule[];
-    keep: HeaderRule[];
+    mask: HeaderRule[];
+    unmask: HeaderRule[];
 };
 
 /** Lightweight helper to disable every trace emitted from specific files. */
@@ -259,8 +313,21 @@ export type DisableFunctionTraceRule = {
     fn?: TraceRulePattern;
     /** Function name (e.g. `"findOne"`, `/^UserService\./`). */
     functionName?: TraceRulePattern;
-    /** Absolute file path where the function was defined. */
+    /** Shortcut for {@link wrapperClass}. */
+    wrapper?: TraceRulePattern;
+    /**
+     * Wrapper/owner name derived from {@link functionName} (e.g. `"UserService"` in `"UserService.create"`).
+     * Useful when multiple functions share the same method name.
+     */
+    wrapperClass?: TraceRulePattern;
+    /** Alias for {@link wrapperClass}. */
+    className?: TraceRulePattern;
+    /** Alias for {@link wrapperClass}. */
+    owner?: TraceRulePattern;
+    /** Source filename reported by the trace event. */
     file?: TraceRulePattern;
+    /** Line number reported by the trace event. */
+    line?: TraceRulePattern;
     /** Shortcut for {@link library}. */
     lib?: TraceRulePattern;
     /** Library/package name inferred from the file path (e.g. `"mongoose"`). */
@@ -280,6 +347,45 @@ export type DisableFunctionTracePredicate = (event: TraceEventForFilter) => bool
 export type DisableFunctionTraceConfig =
     | DisableFunctionTraceRule
     | DisableFunctionTracePredicate;
+
+export type ReproMaskTarget =
+    | 'request.headers'
+    | 'request.body'
+    | 'request.params'
+    | 'request.query'
+    | 'response.body'
+    | 'trace.args'
+    | 'trace.returnValue'
+    | 'trace.error';
+
+export type ReproMaskWhen = DisableFunctionTraceRule & {
+    /** Match HTTP method (e.g. `"GET"`, `/^post$/i`). */
+    method?: TraceRulePattern;
+    /** Match request path without query string (e.g. `"/api/auth/login"`). */
+    path?: TraceRulePattern;
+    /** Match normalized endpoint key (e.g. `"POST /api/auth/login"`). */
+    key?: TraceRulePattern;
+};
+
+export type ReproMaskRule = {
+    when?: ReproMaskWhen;
+    target: ReproMaskTarget | ReproMaskTarget[];
+    /**
+     * Dot/bracket paths to mask (supports `*`, `[0]`, `[*]`).
+     * Examples: `"password"`, `"user.token"`, `"items[*].serial"`, `"0.password"` (for trace args arrays).
+     */
+    paths?: string | string[];
+    /** Key name patterns to mask anywhere in the payload. */
+    keys?: TraceRulePattern;
+    /** Override replacement value for this rule (defaults to config replacement / `"[REDACTED]"`). */
+    replacement?: any;
+};
+
+export type ReproMaskingConfig = {
+    /** Default replacement value (defaults to `"[REDACTED]"`). */
+    replacement?: any;
+    rules?: ReproMaskRule[] | null;
+};
 
 const DEFAULT_INTERCEPTOR_TRACE_RULES: DisableFunctionTraceConfig[] = [
     { fn: /switchToHttp$/i },
@@ -306,8 +412,8 @@ function refreshDisabledFunctionTraceRules() {
 }
 
 let disabledFunctionTraceRules: DisableFunctionTraceConfig[] = computeDisabledFunctionTraceRules();
-let disabledFunctionTypePatterns: Array<string | RegExp> = [];
-let disabledTraceFilePatterns: Array<string | RegExp> = [];
+let disabledFunctionTypePatterns: Array<string | number | RegExp> = [];
+let disabledTraceFilePatterns: Array<string | number | RegExp> = [];
 let __TRACE_LOG_PREF: boolean | null = null;
 
 function setInterceptorTracingEnabled(enabled: boolean) {
@@ -361,11 +467,32 @@ function inferLibraryNameFromFile(file?: string | null): string | null {
     return segments[0] || null;
 }
 
+function inferWrapperClassFromFn(fn?: string | null): string | null {
+    if (!fn) return null;
+    const raw = String(fn);
+    if (!raw) return null;
+    const hashIdx = raw.indexOf('#');
+    if (hashIdx > 0) {
+        const left = raw.slice(0, hashIdx).trim();
+        return left || null;
+    }
+    const dotIdx = raw.lastIndexOf('.');
+    if (dotIdx > 0) {
+        const left = raw.slice(0, dotIdx).trim();
+        return left || null;
+    }
+    return null;
+}
+
 function matchesRule(rule: DisableFunctionTraceRule, event: TraceEventForFilter): boolean {
     const namePattern = rule.fn ?? rule.functionName;
     if (!matchesPattern(event.fn, namePattern)) return false;
 
+    const wrapperPattern = rule.wrapper ?? rule.wrapperClass ?? rule.className ?? rule.owner;
+    if (!matchesPattern(event.wrapperClass, wrapperPattern)) return false;
+
     if (!matchesPattern(event.file, rule.file)) return false;
+    if (!matchesPattern(event.line == null ? null : String(event.line), rule.line)) return false;
 
     const libPattern = rule.lib ?? rule.library;
     if (!matchesPattern(event.library, libPattern)) return false;
@@ -418,12 +545,12 @@ export function setDisabledFunctionTypes(patterns?: TraceRulePattern | null) {
     disabledFunctionTypePatterns = normalizePatternArray(patterns);
 }
 
-function flattenTraceFilePatterns(config: DisableTraceFileConfig): Array<string | RegExp> {
+function flattenTraceFilePatterns(config: DisableTraceFileConfig): Array<string | number | RegExp> {
     if (config === null || config === undefined) return [];
     if (Array.isArray(config)) {
         return config.flatMap(entry => flattenTraceFilePatterns(entry));
     }
-    if (config instanceof RegExp || typeof config === 'string') {
+    if (config instanceof RegExp || typeof config === 'string' || typeof config === 'number') {
         return [config];
     }
     if (typeof config === 'object' && 'file' in config) {
@@ -640,7 +767,87 @@ export function initReproTracing(opts?: ReproTracingInitOptions) {
 /** Optional helper if users want to check it. */
 export function isReproTracingEnabled() { return __TRACER_READY; }
 
-type Ctx = { sid?: string; aid?: string; clockSkewMs?: number };
+function captureSpanContextFromTracer(source?: any): SpanContext | null {
+    try {
+        // Prefer a preserved store captured at the call-site for thenables (e.g., Mongoose Query),
+        // because the tracer intentionally detaches spans before the query is actually executed.
+        const promiseStore = source && source[Symbol.for('__repro_promise_store')];
+        if (promiseStore) {
+            const stack = Array.isArray(promiseStore.__repro_span_stack) ? promiseStore.__repro_span_stack : [];
+            const top = stack.length ? stack[stack.length - 1] : null;
+            const spanId = top && top.id != null ? top.id : null;
+            const parentSpanId = top && top.parentId != null
+                ? top.parentId
+                : (stack.length >= 2 ? (stack[stack.length - 2]?.id ?? null) : null);
+            const depth = top && top.depth != null
+                ? top.depth
+                : (typeof promiseStore.depth === 'number'
+                    ? promiseStore.depth
+                    : (stack.length ? stack.length : null));
+            const traceId = promiseStore.traceId ?? null;
+            if (traceId || spanId !== null || parentSpanId !== null) {
+                return { traceId, spanId, parentSpanId, depth: depth == null ? null : depth };
+            }
+        }
+
+        const fromSource = source && source.__repro_span_context;
+        if (fromSource) {
+            return {
+                traceId: fromSource.traceId ?? null,
+                spanId: fromSource.spanId ?? null,
+                parentSpanId: fromSource.parentSpanId ?? null,
+                depth: fromSource.depth ?? null,
+            };
+        }
+
+        const ctx = __TRACER__?.getCurrentSpanContext?.();
+        if (ctx) {
+            const span: SpanContext = {
+                traceId: ctx.traceId ?? __TRACER__?.getCurrentTraceId?.() ?? null,
+                spanId: ctx.spanId ?? null,
+                parentSpanId: ctx.parentSpanId ?? null,
+                depth: ctx.depth ?? null,
+            };
+            if (span.traceId || span.spanId !== null || span.parentSpanId !== null) {
+                return span;
+            }
+        } else if (__TRACER__?.getCurrentTraceId) {
+            const traceId = __TRACER__?.getCurrentTraceId?.() ?? null;
+            if (traceId) {
+                return { traceId, spanId: null, parentSpanId: null, depth: null };
+            }
+        }
+    } catch {}
+    return null;
+}
+
+function isExcludedSpanId(spanId: string | number | null | undefined): boolean {
+    if (spanId === null || spanId === undefined) return false;
+    try {
+        const excluded = (getCtx() as Ctx).excludedSpanIds;
+        if (!excluded || excluded.size === 0) return false;
+        return excluded.has(String(spanId));
+    } catch {
+        return false;
+    }
+}
+
+function shouldCaptureDbSpan(span: SpanContext | null | undefined): span is SpanContext {
+    if (!span || span.spanId === null || span.spanId === undefined) return false;
+    if (isExcludedSpanId(span.spanId)) return false;
+    return true;
+}
+
+function attachSpanContext<T extends Record<string, any>>(target: T, span?: SpanContext | null): T {
+    if (!target) return target;
+    const ctx = span ?? captureSpanContextFromTracer();
+    if (ctx) {
+        try { (target as any).spanContext = ctx; } catch {}
+    }
+    return target;
+}
+
+type Ctx = { sid?: string; aid?: string; clockSkewMs?: number; excludedSpanIds?: Set<string> };
 const als = new AsyncLocalStorage<Ctx>();
 const getCtx = () => als.getStore() || {};
 
@@ -894,21 +1101,21 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
 }
 
 async function post(
-    apiBase: string,
-    tenantId: string,
-    appId: string,
-    appSecret: string,
+    cfg: { tenantId: string; appId: string; appSecret: string; apiBase?: string },
     sessionId: string,
     body: any,
 ) {
     try {
+        const envBase = typeof process !== 'undefined' ? (process as any)?.env?.REPRO_API_BASE : undefined;
+        const legacyBase = (cfg as any)?.apiBase;
+        const apiBase = String(envBase || legacyBase || 'https://oozy-loreta-gully.ngrok-free.dev').replace(/\/+$/, '');
         await fetch(`${apiBase}/v1/sessions/${sessionId}/backend`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'X-App-Id': appId,
-                'X-App-Secret': appSecret,
-                'X-Tenant-Id': tenantId,
+                'X-App-Id': cfg.appId,
+                'X-App-Secret': cfg.appSecret,
+                'X-Tenant-Id': cfg.tenantId,
             },
             body: JSON.stringify(body),
         });
@@ -1299,6 +1506,8 @@ const DEFAULT_SENSITIVE_HEADERS: Array<string | RegExp> = [
     'set-cookie',
 ];
 
+const DEFAULT_MASK_REPLACEMENT = '[REDACTED]';
+
 function normalizeHeaderRules(rules?: HeaderRule | HeaderRule[] | null): HeaderRule[] {
     return normalizePatternArray<HeaderRule>(rules || []);
 }
@@ -1316,14 +1525,14 @@ function matchesHeaderRule(name: string, rules: HeaderRule[]): boolean {
 
 function normalizeHeaderCaptureConfig(raw?: boolean | HeaderCaptureOptions): NormalizedHeaderCapture {
     if (raw === false) {
-        return { enabled: false, allowSensitive: false, drop: [], keep: [] };
+        return { enabled: false, allowSensitive: false, mask: [], unmask: [] };
     }
     const opts: HeaderCaptureOptions = raw && raw !== true ? raw : {};
     return {
         enabled: true,
         allowSensitive: opts.allowSensitiveHeaders === true,
-        drop: normalizeHeaderRules(opts.dropHeaders),
-        keep: normalizeHeaderRules(opts.keepHeaders),
+        mask: [...normalizeHeaderRules(opts.maskHeaders), ...normalizeHeaderRules(opts.dropHeaders)],
+        unmask: [...normalizeHeaderRules(opts.unmaskHeaders), ...normalizeHeaderRules(opts.keepHeaders)],
     };
 }
 
@@ -1344,22 +1553,208 @@ function sanitizeHeaders(headers: any, rawCfg?: boolean | HeaderCaptureOptions) 
     const cfg = normalizeHeaderCaptureConfig(rawCfg);
     if (!cfg.enabled) return {};
 
-    const dropList = cfg.allowSensitive ? cfg.drop : [...DEFAULT_SENSITIVE_HEADERS, ...cfg.drop];
     const out: Record<string, any> = {};
 
     for (const [rawKey, rawVal] of Object.entries(headers || {})) {
         const key = String(rawKey || '').toLowerCase();
         if (!key) continue;
-        const shouldDrop = matchesHeaderRule(key, dropList);
-        const keep = matchesHeaderRule(key, cfg.keep);
-        if (shouldDrop && !keep) continue;
-
         const sanitizedValue = sanitizeHeaderValue(rawVal);
         if (sanitizedValue !== undefined) {
             out[key] = sanitizedValue;
         }
     }
+
+    const maskList = cfg.allowSensitive ? cfg.mask : [...DEFAULT_SENSITIVE_HEADERS, ...cfg.mask];
+    Object.keys(out).forEach((key) => {
+        if (!matchesHeaderRule(key, maskList)) return;
+        if (matchesHeaderRule(key, cfg.unmask)) return;
+        const current = out[key];
+        if (Array.isArray(current)) {
+            out[key] = current.map(() => DEFAULT_MASK_REPLACEMENT);
+            return;
+        }
+        out[key] = DEFAULT_MASK_REPLACEMENT;
+    });
+
     return out;
+}
+
+// ===================================================================
+// Masking (request/response payloads + trace args/returns/errors)
+// ===================================================================
+type NormalizedMaskRule = {
+    when?: ReproMaskWhen;
+    targets: ReproMaskTarget[];
+    paths: string[][];
+    keys?: TraceRulePattern;
+    replacement: any;
+};
+
+type NormalizedMaskingConfig = {
+    replacement: any;
+    rules: NormalizedMaskRule[];
+};
+
+type MaskRequestContext = {
+    method: string;
+    path: string;
+    key: string;
+};
+
+function normalizeMaskTargets(target: ReproMaskTarget | ReproMaskTarget[]): ReproMaskTarget[] {
+    const out = Array.isArray(target) ? target : [target];
+    return out.filter((t): t is ReproMaskTarget => typeof t === 'string' && t.length > 0);
+}
+
+function parseMaskPath(raw: string): string[] {
+    if (!raw) return [];
+    let path = String(raw).trim();
+    if (!path) return [];
+    if (path.startsWith('$.')) path = path.slice(2);
+    if (path.startsWith('.')) path = path.slice(1);
+    path = path.replace(/\[(\d+|\*)\]/g, '.$1');
+    return path.split('.').map(s => s.trim()).filter(Boolean);
+}
+
+function normalizeMaskPaths(paths?: string | string[]): string[][] {
+    if (!paths) return [];
+    const list = Array.isArray(paths) ? paths : [paths];
+    return list
+        .map(p => parseMaskPath(p))
+        .filter(parts => parts.length > 0);
+}
+
+function normalizeMaskingConfig(raw?: ReproMaskingConfig): NormalizedMaskingConfig | null {
+    const rules = raw?.rules;
+    if (!Array.isArray(rules) || rules.length === 0) return null;
+    const replacement = raw?.replacement ?? DEFAULT_MASK_REPLACEMENT;
+    const normalized: NormalizedMaskRule[] = [];
+    for (const rule of rules) {
+        if (!rule) continue;
+        const targets = normalizeMaskTargets(rule.target);
+        if (!targets.length) continue;
+        const paths = normalizeMaskPaths(rule.paths);
+        const keys = rule.keys ?? undefined;
+        if (!paths.length && !keys) continue;
+        normalized.push({
+            when: rule.when,
+            targets,
+            paths,
+            keys,
+            replacement: rule.replacement ?? replacement,
+        });
+    }
+    return normalized.length ? { replacement, rules: normalized } : null;
+}
+
+function maskWhenRequiresTrace(when: ReproMaskWhen): boolean {
+    return Boolean(
+        when.fn ||
+        when.functionName ||
+        when.wrapper ||
+        when.wrapperClass ||
+        when.className ||
+        when.owner ||
+        when.file ||
+        when.lib ||
+        when.library ||
+        when.type ||
+        when.functionType ||
+        when.event ||
+        when.eventType
+    );
+}
+
+function matchesMaskWhen(when: ReproMaskWhen | undefined, req: MaskRequestContext, trace: TraceEventForFilter | null): boolean {
+    if (!when) return true;
+    if (!matchesPattern(req.method, when.method)) return false;
+    if (!matchesPattern(req.path, when.path)) return false;
+    if (!matchesPattern(req.key, when.key)) return false;
+
+    if (maskWhenRequiresTrace(when)) {
+        if (!trace) return false;
+        if (!matchesRule(when, trace)) return false;
+    }
+
+    return true;
+}
+
+function maskKeysInPlace(node: any, keys: TraceRulePattern, replacement: any) {
+    if (!node) return;
+    if (Array.isArray(node)) {
+        node.forEach(item => maskKeysInPlace(item, keys, replacement));
+        return;
+    }
+    if (typeof node !== 'object') return;
+    Object.keys(node).forEach((key) => {
+        if (matchesPattern(key, keys, false)) {
+            try { node[key] = replacement; } catch {}
+            return;
+        }
+        maskKeysInPlace(node[key], keys, replacement);
+    });
+}
+
+function maskPathInPlace(node: any, pathParts: string[], replacement: any, depth: number = 0) {
+    if (!node) return;
+    if (depth >= pathParts.length) return;
+    const part = pathParts[depth];
+    const isLast = depth === pathParts.length - 1;
+
+    const applyAt = (container: any, key: string | number) => {
+        if (!container) return;
+        try { container[key] = replacement; } catch {}
+    };
+
+    if (part === '*') {
+        if (Array.isArray(node)) {
+            for (let i = 0; i < node.length; i++) {
+                if (isLast) applyAt(node, i);
+                else maskPathInPlace(node[i], pathParts, replacement, depth + 1);
+            }
+        } else if (typeof node === 'object') {
+            for (const key of Object.keys(node)) {
+                if (isLast) applyAt(node, key);
+                else maskPathInPlace(node[key], pathParts, replacement, depth + 1);
+            }
+        }
+        return;
+    }
+
+    const index = Number(part);
+    const isIndex = Number.isInteger(index) && String(index) === part;
+    if (Array.isArray(node) && isIndex) {
+        if (index < 0 || index >= node.length) return;
+        if (isLast) applyAt(node, index);
+        else maskPathInPlace(node[index], pathParts, replacement, depth + 1);
+        return;
+    }
+
+    if (typeof node !== 'object') return;
+    if (!Object.prototype.hasOwnProperty.call(node, part)) return;
+    if (isLast) applyAt(node, part);
+    else maskPathInPlace(node[part], pathParts, replacement, depth + 1);
+}
+
+function applyMasking(
+    target: ReproMaskTarget,
+    value: any,
+    req: MaskRequestContext,
+    trace: TraceEventForFilter | null,
+    masking: NormalizedMaskingConfig | null
+) {
+    if (!masking || !masking.rules.length) return value;
+    if (value === undefined) return value;
+    for (const rule of masking.rules) {
+        if (!rule.targets.includes(target)) continue;
+        if (!matchesMaskWhen(rule.when, req, trace)) continue;
+        const replacement = rule.replacement ?? masking.replacement ?? DEFAULT_MASK_REPLACEMENT;
+        if (rule.keys) maskKeysInPlace(value, rule.keys, replacement);
+        if (rule.paths.length) {
+            rule.paths.forEach(parts => maskPathInPlace(value, parts, replacement, 0));
+        }
+    }
+    return value;
 }
 
 // ===================================================================
@@ -1369,12 +1764,14 @@ export type ReproMiddlewareConfig = {
     appId: string;
     tenantId: string;
     appSecret: string;
-    apiBase: string;
-    /** Configure header capture/redaction. Defaults to capturing with sensitive headers removed. */
+    /** Configure header capture/masking. Defaults to capturing with sensitive headers masked. */
     captureHeaders?: boolean | HeaderCaptureOptions;
+    /** Optional masking rules for request/response payloads and function traces. */
+    masking?: ReproMaskingConfig;
 };
 
 export function reproMiddleware(cfg: ReproMiddlewareConfig) {
+    const masking = normalizeMaskingConfig(cfg.masking);
     return function (req: Request, res: Response, next: NextFunction) {
         const sid = (req.headers['x-bug-session-id'] as string) || '';
         const aid = (req.headers['x-bug-action-id'] as string) || '';
@@ -1387,8 +1784,10 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
         const rid = nextRequestId(requestEpochMs);
         const t0 = requestStartRaw;
         const url = (req as any).originalUrl || req.url || '/';
+        const urlPathOnly = (url || '/').split('?')[0] || '/';
         const path = url; // back-compat
         const key = normalizeRouteKey(req.method, url);
+        const maskReq: MaskRequestContext = { method: String(req.method || 'GET').toUpperCase(), path: urlPathOnly, key };
         const requestHeaders = sanitizeHeaders(req.headers, cfg.captureHeaders);
         beginSessionRequest(sid);
 
@@ -1420,7 +1819,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             return fn();
         };
 
-        runInTrace(() => als.run({ sid, aid, clockSkewMs }, () => {
+	        runInTrace(() => als.run({ sid, aid, clockSkewMs, excludedSpanIds: new Set<string>() }, () => {
             const events: TraceEventRecord[] = [];
             let endpointTrace: EndpointTraceInfo | null = null;
             let preferredAppTrace: EndpointTraceInfo | null = null;
@@ -1431,12 +1830,12 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
             let finishedAt: number | null = null;
             let lastEventAt: number = Date.now();
             let idleTimer: NodeJS.Timeout | null = null;
-            let hardStopTimer: NodeJS.Timeout | null = null;
+	            let hardStopTimer: NodeJS.Timeout | null = null;
             let drainTimer: NodeJS.Timeout | null = null;
             let flushPayload: null | (() => void) = null;
             const activeSpans = new Set<string>();
             let anonymousSpanDepth = 0;
-            const ACTIVE_SPAN_FORCE_FLUSH_MS = 30000; // safety guard against leaks
+	            const ACTIVE_SPAN_FORCE_FLUSH_MS = 60000; // hard cutoff after finish to avoid endlessly running replies
 
             const clearTimers = () => {
                 if (idleTimer) {
@@ -1464,12 +1863,12 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                 idleTimer = setTimeout(() => doFlush(false), delay);
             };
 
-            const doFlush = (force: boolean = false) => {
-                if (flushed) return;
-                const now = Date.now();
-                const stillActive = hasActiveWork();
-                const quietMs = now - lastEventAt;
-                const waitedFinish = finishedAt === null ? 0 : now - finishedAt;
+	            const doFlush = (force: boolean = false) => {
+	                if (flushed) return;
+	                const now = Date.now();
+	                const stillActive = hasActiveWork();
+	                const quietMs = now - lastEventAt;
+	                const waitedFinish = finishedAt === null ? 0 : now - finishedAt;
 
                 // If work is still active and we haven't been quiet long enough, defer.
                 if (stillActive && !force) {
@@ -1477,17 +1876,20 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                     scheduleIdleFlush(Math.max(remaining, 10));
                     return;
                 }
-                if (stillActive && force) {
-                    // Allow forced flush after either linger window of silence or max guard.
-                    if (quietMs < TRACE_LINGER_AFTER_FINISH_MS && waitedFinish < ACTIVE_SPAN_FORCE_FLUSH_MS) {
-                        const remainingQuiet = TRACE_LINGER_AFTER_FINISH_MS - quietMs;
-                        const remainingGuard = ACTIVE_SPAN_FORCE_FLUSH_MS - waitedFinish;
-                        scheduleIdleFlush(Math.max(10, Math.min(remainingQuiet, remainingGuard)));
-                        return;
-                    }
-                }
-                flushed = true;
-                clearTimers();
+	                if (stillActive && force) {
+	                    // Allow forced flush after either linger window of silence or max guard.
+	                    if (quietMs < TRACE_LINGER_AFTER_FINISH_MS && waitedFinish < ACTIVE_SPAN_FORCE_FLUSH_MS) {
+	                        const remainingQuiet = TRACE_LINGER_AFTER_FINISH_MS - quietMs;
+	                        const remainingGuard = ACTIVE_SPAN_FORCE_FLUSH_MS - waitedFinish;
+	                        if (hardStopTimer) {
+	                            try { clearTimeout(hardStopTimer); } catch {}
+	                        }
+	                        hardStopTimer = setTimeout(() => doFlush(true), Math.max(10, Math.min(remainingQuiet, remainingGuard)));
+	                        return;
+	                    }
+	                }
+	                flushed = true;
+	                clearTimers();
                 try { unsubscribe && unsubscribe(); } catch {}
                 try { flushPayload?.(); } catch {}
             };
@@ -1514,6 +1916,10 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                         unsubscribe = __TRACER__.tracer.on((ev: any) => {
                             if (!ev || ev.traceId !== tidNow) return;
 
+                            const sourceFileForLibrary = typeof ev.sourceFile === 'string' && ev.sourceFile
+                                ? String(ev.sourceFile)
+                                : null;
+
                             const evt: TraceEventRecord = {
                                 t: alignTimestamp(ev.t),
                                 type: ev.type,
@@ -1529,14 +1935,44 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 evt.functionType = ev.functionType;
                             }
 
+                            const candidate: TraceEventForFilter = {
+                                type: evt.type,
+                                eventType: evt.type,
+                                functionType: evt.functionType ?? null,
+                                fn: evt.fn,
+                                wrapperClass: inferWrapperClassFromFn(evt.fn),
+                                file: evt.file ?? null,
+                                line: evt.line ?? null,
+                                depth: evt.depth,
+                                library: inferLibraryNameFromFile(sourceFileForLibrary ?? evt.file),
+                            };
+
                             if (ev.args !== undefined) {
-                                evt.args = sanitizeTraceArgs(ev.args);
+                                evt.args = applyMasking(
+                                    'trace.args',
+                                    sanitizeTraceArgs(ev.args),
+                                    maskReq,
+                                    candidate,
+                                    masking
+                                );
                             }
                             if (ev.returnValue !== undefined) {
-                                evt.returnValue = sanitizeTraceValue(ev.returnValue);
+                                evt.returnValue = applyMasking(
+                                    'trace.returnValue',
+                                    sanitizeTraceValue(ev.returnValue),
+                                    maskReq,
+                                    candidate,
+                                    masking
+                                );
                             }
                             if (ev.error !== undefined) {
-                                evt.error = sanitizeTraceValue(ev.error);
+                                evt.error = applyMasking(
+                                    'trace.error',
+                                    sanitizeTraceValue(ev.error),
+                                    maskReq,
+                                    candidate,
+                                    masking
+                                );
                             }
                             if (ev.threw !== undefined) {
                                 evt.threw = Boolean(ev.threw);
@@ -1545,16 +1981,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 evt.unawaited = ev.unawaited === true;
                             }
 
-                            const candidate: TraceEventForFilter = {
-                                type: evt.type,
-                                eventType: evt.type,
-                                functionType: evt.functionType ?? null,
-                                fn: evt.fn,
-                                file: evt.file ?? null,
-                                depth: evt.depth,
-                                library: inferLibraryNameFromFile(evt.file),
-                            };
-
+                            const dropEvent = shouldDropTraceEvent(candidate);
                             const spanKey = normalizeSpanId(evt.spanId);
                             if (evt.type === 'enter') {
                                 lastEventAt = Date.now();
@@ -1572,7 +1999,10 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 }
                             }
 
-                            if (shouldDropTraceEvent(candidate)) {
+                            if (dropEvent) {
+                                if (evt.type === 'enter' && spanKey) {
+                                    try { (getCtx() as Ctx).excludedSpanIds?.add(spanKey); } catch {}
+                                }
                                 if (finished) {
                                     scheduleIdleFlush();
                                 }
@@ -1633,9 +2063,55 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             ?? firstAppTrace
                             ?? { fn: null, file: null, line: null, functionType: null };
                         const traceBatches = chunkArray(orderedEvents, TRACE_BATCH_SIZE);
-                        const requestBody = sanitizeRequestSnapshot((req as any).body);
-                        const requestParams = sanitizeRequestSnapshot((req as any).params);
-                        const requestQuery = sanitizeRequestSnapshot((req as any).query);
+                        const endpointTraceCtx: TraceEventForFilter | null = (() => {
+                            if (!chosenEndpoint?.fn && !chosenEndpoint?.file) return null;
+                            return {
+                                type: 'enter',
+                                eventType: 'enter',
+                                fn: chosenEndpoint.fn ?? undefined,
+                                wrapperClass: inferWrapperClassFromFn(chosenEndpoint.fn),
+                                file: chosenEndpoint.file ?? null,
+                                line: chosenEndpoint.line ?? null,
+                                functionType: chosenEndpoint.functionType ?? null,
+                                library: inferLibraryNameFromFile(chosenEndpoint.file),
+                            };
+                        })();
+
+                        const requestBody = applyMasking(
+                            'request.body',
+                            sanitizeRequestSnapshot((req as any).body),
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
+                        const requestParams = applyMasking(
+                            'request.params',
+                            sanitizeRequestSnapshot((req as any).params),
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
+                        const requestQuery = applyMasking(
+                            'request.query',
+                            sanitizeRequestSnapshot((req as any).query),
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
+                        const maskedHeaders = applyMasking(
+                            'request.headers',
+                            requestHeaders,
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
+                        const responseBody = applyMasking(
+                            'response.body',
+                            capturedBody === undefined ? undefined : sanitizeRequestSnapshot(capturedBody),
+                            maskReq,
+                            endpointTraceCtx,
+                            masking
+                        );
 
                         const requestPayload: Record<string, any> = {
                             rid,
@@ -1644,9 +2120,9 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             path,
                             status: res.statusCode,
                             durMs: Date.now() - t0,
-                            headers: requestHeaders,
+                            headers: maskedHeaders,
                             key,
-                            respBody: capturedBody,
+                            respBody: responseBody,
                             trace: traceBatches.length ? undefined : '[]',
                         };
                         if (requestBody !== undefined) requestPayload.body = requestBody;
@@ -1654,13 +2130,13 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                         if (requestQuery !== undefined) requestPayload.query = requestQuery;
                         requestPayload.entryPoint = chosenEndpoint;
 
-                        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-                            entries: [{
-                                actionId: aid,
-                                request: requestPayload,
-                                t: alignedNow(),
-                            }]
-                        });
+	                        post(cfg, sid, {
+	                            entries: [{
+	                                actionId: aid,
+	                                request: requestPayload,
+	                                t: alignedNow(),
+	                            }]
+	                        });
 
                         if (traceBatches.length) {
                             for (let i = 0; i < traceBatches.length; i++) {
@@ -1668,12 +2144,12 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                 let traceStr = '[]';
                                 try { traceStr = JSON.stringify(batch); } catch {}
 
-                                post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-                                    entries: [{
-                                        actionId: aid,
-                                        trace: traceStr,
-                                        traceBatch: {
-                                            rid,
+	                                post(cfg, sid, {
+	                                    entries: [{
+	                                        actionId: aid,
+	                                        trace: traceStr,
+	                                        traceBatch: {
+	                                            rid,
                                             index: i,
                                             total: traceBatches.length,
                                         },
@@ -1726,7 +2202,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 //   - ONLY schema middleware (pre/post) for specific ops
 //   - keeps your existing doc-diff hooks
 // ===================================================================
-export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appSecret: string; apiBase: string }) {
+export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appSecret: string }) {
     return function (schema: Schema) {
         // -------- pre/post save (unchanged) --------
         schema.pre('save', { document: true }, async function (next) {
@@ -1745,6 +2221,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 wasNew: this.isNew,
                 before,
                 collection: resolveCollectionOrWarn(this, 'doc'),
+                spanContext: captureSpanContextFromTracer(this),
             };
             next();
         });
@@ -1758,15 +2235,24 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const before = meta.before ?? null;
             const after = this.toObject({ depopulate: true });
             const collection = meta.collection || resolveCollectionOrWarn(this, 'doc');
+            const spanContext = meta.spanContext || captureSpanContextFromTracer(this);
+            if (!shouldCaptureDbSpan(spanContext)) return;
 
             const query = meta.wasNew
                 ? { op: 'insertOne', doc: after }
                 : { filter: { _id: this._id }, update: buildMinimalUpdate(before, after), options: { upsert: false } };
 
-            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
-                entries: [{
-                    actionId: (getCtx() as Ctx).aid!,
-                    db: [{ collection, pk: { _id: (this as any)._id }, before, after, op: meta.wasNew ? 'insert' : 'update', query }],
+	            post(cfg, (getCtx() as Ctx).sid!, {
+	                entries: [{
+	                    actionId: (getCtx() as Ctx).aid!,
+	                    db: [attachSpanContext({
+	                        collection,
+                        pk: { _id: (this as any)._id },
+                        before,
+                        after,
+                        op: meta.wasNew ? 'insert' : 'update',
+                        query,
+                    }, spanContext)],
                     t: alignedNow(),
                 }]
             });
@@ -1782,6 +2268,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 (this as any).__repro_before = await model.findOne(filter).lean().exec();
                 this.setOptions({ new: true });
                 (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
+                (this as any).__repro_spanContext = captureSpanContextFromTracer(this);
             } catch {}
             next();
         });
@@ -1793,12 +2280,20 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const before = (this as any).__repro_before ?? null;
             const after = res ?? null;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
+            const spanContext = (this as any).__repro_spanContext || captureSpanContextFromTracer(this);
+            if (!shouldCaptureDbSpan(spanContext)) return;
             const pk = after?._id ?? before?._id;
 
-            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
-                entries: [{
-                    actionId: (getCtx() as Ctx).aid!,
-                    db: [{ collection, pk: { _id: pk }, before, after, op: after && before ? 'update' : after ? 'insert' : 'update' }],
+	            post(cfg, (getCtx() as Ctx).sid!, {
+	                entries: [{
+	                    actionId: (getCtx() as Ctx).aid!,
+	                    db: [attachSpanContext({
+	                        collection,
+                        pk: { _id: pk },
+                        before,
+                        after,
+                        op: after && before ? 'update' : after ? 'insert' : 'update',
+                    }, spanContext)],
                     t: alignedNow()
                 }]
             });
@@ -1812,6 +2307,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 (this as any).__repro_before = await (this.model as Model<any>).findOne(filter).lean().exec();
                 (this as any).__repro_collection = resolveCollectionOrWarn(this, 'query');
                 (this as any).__repro_filter = filter;
+                (this as any).__repro_spanContext = captureSpanContextFromTracer(this);
             } catch {}
             next();
         });
@@ -1822,10 +2318,19 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             if (!before) return;
             const collection = (this as any).__repro_collection || resolveCollectionOrWarn(this, 'query');
             const filter = (this as any).__repro_filter ?? { _id: before._id };
-            post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, (getCtx() as Ctx).sid!, {
-                entries: [{
-                    actionId: (getCtx() as Ctx).aid!,
-                    db: [{ collection, pk: { _id: before._id }, before, after: null, op: 'delete', query: { filter } }],
+            const spanContext = (this as any).__repro_spanContext || captureSpanContextFromTracer(this);
+            if (!shouldCaptureDbSpan(spanContext)) return;
+	            post(cfg, (getCtx() as Ctx).sid!, {
+	                entries: [{
+	                    actionId: (getCtx() as Ctx).aid!,
+	                    db: [attachSpanContext({
+	                        collection,
+                        pk: { _id: before._id },
+                        before,
+                        after: null,
+                        op: 'delete',
+                        query: { filter },
+                    }, spanContext)],
                     t: alignedNow()
                 }]
             });
@@ -1867,13 +2372,19 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                         t0: Date.now(),
                         collection: this?.model?.collection?.name || 'unknown',
                         op,
+                        spanContext: captureSpanContextFromTracer(this),
                         filter: sanitizeDbValue(this.getFilter?.() ?? this._conditions ?? undefined),
                         update: sanitizeDbValue(this.getUpdate?.() ?? this._update ?? undefined),
                         projection: sanitizeDbValue(this.projection?.() ?? this._fields ?? undefined),
                         options: sanitizeDbValue(this.getOptions?.() ?? this.options ?? undefined),
                     };
                 } catch {
-                    (this as any).__repro_qmeta = { t0: Date.now(), collection: 'unknown', op };
+                    (this as any).__repro_qmeta = {
+                        t0: Date.now(),
+                        collection: 'unknown',
+                        op,
+                        spanContext: captureSpanContextFromTracer(this),
+                    };
                 }
                 next();
             });
@@ -1884,6 +2395,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
 
                 const meta = (this as any).__repro_qmeta || { t0: Date.now(), collection: 'unknown', op };
                 const resultMeta = summarizeQueryResult(op, res);
+                const spanContext = meta.spanContext || captureSpanContextFromTracer(this);
 
                 emitDbQuery(cfg, sid, aid, {
                     collection: meta.collection,
@@ -1892,6 +2404,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                     resultMeta,
                     durMs: Date.now() - meta.t0,
                     t: alignedNow(),
+                    spanContext,
                 });
             });
         }
@@ -1906,9 +2419,14 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                     t0: Date.now(),
                     collection: this?.collection?.name || this?.model?.collection?.name || 'unknown',
                     docs: sanitizeDbValue(docs),
+                    spanContext: captureSpanContextFromTracer(this),
                 };
             } catch {
-                (this as any).__repro_insert_meta = { t0: Date.now(), collection: 'unknown' };
+                (this as any).__repro_insert_meta = {
+                    t0: Date.now(),
+                    collection: 'unknown',
+                    spanContext: captureSpanContextFromTracer(this),
+                };
             }
             next();
         } as any);
@@ -1918,6 +2436,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             if (!sid) return;
             const meta = (this as any).__repro_insert_meta || { t0: Date.now(), collection: 'unknown' };
             const resultMeta = Array.isArray(docs) ? { inserted: docs.length } : summarizeQueryResult('insertMany', docs);
+            const spanContext = meta.spanContext || captureSpanContextFromTracer(this);
 
             emitDbQuery(cfg, sid, aid, {
                 collection: meta.collection,
@@ -1926,6 +2445,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 resultMeta,
                 durMs: Date.now() - meta.t0,
                 t: alignedNow(),
+                spanContext,
             });
         } as any);
 
@@ -1935,9 +2455,14 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                     t0: Date.now(),
                     collection: this?.collection?.name || this?.model?.collection?.name || 'unknown',
                     ops: sanitizeDbValue(ops),
+                    spanContext: captureSpanContextFromTracer(this),
                 };
             } catch {
-                (this as any).__repro_bulk_meta = { t0: Date.now(), collection: 'unknown' };
+                (this as any).__repro_bulk_meta = {
+                    t0: Date.now(),
+                    collection: 'unknown',
+                    spanContext: captureSpanContextFromTracer(this),
+                };
             }
             next();
         } as any);
@@ -1948,6 +2473,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
             const meta = (this as any).__repro_bulk_meta || { t0: Date.now(), collection: 'unknown' };
             const bulkResult = summarizeBulkResult(res);
             const resultMeta = { ...bulkResult, result: sanitizeResultForMeta(res?.result ?? res) };
+            const spanContext = meta.spanContext || captureSpanContextFromTracer(this);
 
             emitDbQuery(cfg, sid, aid, {
                 collection: meta.collection,
@@ -1956,6 +2482,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 resultMeta,
                 durMs: Date.now() - meta.t0,
                 t: alignedNow(),
+                spanContext,
             });
         } as any);
 
@@ -1969,10 +2496,16 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                         this?._model?.collection?.name ||
                         (this?.model && this.model.collection?.name) ||
                         'unknown',
+                    spanContext: captureSpanContextFromTracer(this),
                     pipeline: sanitizeDbValue(this.pipeline?.() ?? this._pipeline ?? undefined),
                 };
             } catch {
-                (this as any).__repro_aggmeta = { t0: Date.now(), collection: 'unknown', pipeline: undefined };
+                (this as any).__repro_aggmeta = {
+                    t0: Date.now(),
+                    collection: 'unknown',
+                    pipeline: undefined,
+                    spanContext: captureSpanContextFromTracer(this),
+                };
             }
             next();
         });
@@ -1983,6 +2516,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
 
             const meta = (this as any).__repro_aggmeta || { t0: Date.now(), collection: 'unknown' };
             const resultMeta = summarizeQueryResult('aggregate', res);
+            const spanContext = meta.spanContext || captureSpanContextFromTracer(this);
 
             emitDbQuery(cfg, sid, aid, {
                 collection: meta.collection,
@@ -1991,6 +2525,7 @@ export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appS
                 resultMeta,
                 durMs: Date.now() - meta.t0,
                 t: alignedNow(),
+                spanContext,
             });
         });
     };
@@ -2100,19 +2635,22 @@ function dehydrateComplexValue(value: any) {
 
 function emitDbQuery(cfg: any, sid?: string, aid?: string, payload?: any) {
     if (!sid) return;
-    post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-        entries: [{
-            actionId: aid ?? null,
-            db: [{
-                collection: payload.collection,
-                op: payload.op,
-                query: payload.query ?? undefined,
-                resultMeta: payload.resultMeta ?? undefined,
-                durMs: payload.durMs ?? undefined,
-                pk: null, before: null, after: null,
-                error: payload.error ?? undefined,
-            }],
-            t: payload.t,
+    const spanContext = payload?.spanContext ?? captureSpanContextFromTracer();
+    if (!shouldCaptureDbSpan(spanContext)) return;
+    const dbEntry = attachSpanContext({
+        collection: payload.collection,
+        op: payload.op,
+        query: payload.query ?? undefined,
+        resultMeta: payload.resultMeta ?? undefined,
+        durMs: payload.durMs ?? undefined,
+        pk: null, before: null, after: null,
+        error: payload.error ?? undefined,
+    }, spanContext);
+	    post(cfg, sid, {
+	        entries: [{
+	            actionId: aid ?? null,
+	            db: [dbEntry],
+	            t: payload.t,
         }]
     });
 }
@@ -2161,7 +2699,6 @@ export type SendgridPatchConfig = {
     appId: string;
     tenantId: string;
     appSecret: string;
-    apiBase: string;
     resolveContext?: () => { sid?: string; aid?: string } | undefined;
 };
 
@@ -2216,11 +2753,11 @@ export function patchSendgridMail(cfg: SendgridPatchConfig) {
         if (!sid) return;
 
         const norm = normalizeSendgridMessage(rawMsg);
-        post(cfg.apiBase, cfg.tenantId, cfg.appId, cfg.appSecret, sid, {
-            entries: [{
-                actionId: aid ?? null,
-                email: {
-                    provider: 'sendgrid',
+	        post(cfg, sid, {
+	            entries: [{
+	                actionId: aid ?? null,
+	                email: {
+	                    provider: 'sendgrid',
                     kind,
                     to: norm.to, cc: norm.cc, bcc: norm.bcc, from: norm.from,
                     subject: norm.subject, text: norm.text, html: norm.html,

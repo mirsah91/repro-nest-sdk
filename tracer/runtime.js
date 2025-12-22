@@ -86,15 +86,15 @@ function pushSpan(ctx, depth, explicitParentId = null) {
     const parent = explicitParentId !== null && explicitParentId !== undefined
         ? { id: explicitParentId, parentId: null }
         : (stack.length ? stack[stack.length - 1] : null);
-    const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null, depth };
+    const span = { id: ++SPAN_COUNTER, parentId: parent ? parent.id : null, depth, file: null, line: null, sourceFile: null };
     stack.push(span);
     return span;
 }
 
 function popSpan(ctx) {
     const stack = ctx.__repro_span_stack;
-    if (!Array.isArray(stack) || !stack.length) return { id: null, parentId: null, depth: null };
-    return stack.pop() || { id: null, parentId: null, depth: null };
+    if (!Array.isArray(stack) || !stack.length) return { id: null, parentId: null, depth: null, file: null, line: null, sourceFile: null };
+    return stack.pop() || { id: null, parentId: null, depth: null, file: null, line: null, sourceFile: null };
 }
 
 const trace = {
@@ -120,14 +120,36 @@ const trace = {
         }
         frameStack.push(frameUnawaited);
 
+        const fallbackDefinitionFile = meta?.file || null;
+        let file = meta?.file || null;
+        let line = meta?.line || null;
+        let sourceFile = meta?.sourceFile || null;
+        try {
+            const queue = ctx.__repro_callsite_queue;
+            if (Array.isArray(queue) && queue.length) {
+                const override = queue.shift();
+                if (override && (override.file || override.line !== null && override.line !== undefined)) {
+                    if (!sourceFile && fallbackDefinitionFile) sourceFile = fallbackDefinitionFile;
+                    if (override.file) file = override.file;
+                    if (override.line !== null && override.line !== undefined) line = override.line;
+                }
+            }
+        } catch {}
+
         const span = pushSpan(ctx, ctx.depth, parentSpanIdOverride);
+        try {
+            span.file = file;
+            span.line = line;
+            span.sourceFile = sourceFile;
+        } catch {}
 
         emit({
             type: 'enter',
             t: Date.now(),
             fn,
-            file: meta?.file,
-            line: meta?.line,
+            file,
+            line,
+            sourceFile,
             functionType: meta?.functionType || null,
             traceId: ctx.traceId,
             depth: ctx.depth,
@@ -144,6 +166,7 @@ const trace = {
             fn: meta?.fn,
             file: meta?.file,
             line: meta?.line,
+            sourceFile: meta?.sourceFile || null,
             functionType: meta?.functionType || null
         };
         const frameStack = ctx.__repro_frame_unawaited;
@@ -153,7 +176,7 @@ const trace = {
         const spanStackRef = Array.isArray(ctx.__repro_span_stack) ? ctx.__repro_span_stack : [];
         const spanInfoPeek = spanStackRef.length
             ? spanStackRef[spanStackRef.length - 1]
-            : { id: null, parentId: null, depth: depthAtExit };
+            : { id: null, parentId: null, depth: depthAtExit, file: baseMeta.file, line: baseMeta.line, sourceFile: baseMeta.sourceFile };
         const baseDetail = {
             args: detail?.args,
             returnValue: detail?.returnValue,
@@ -188,8 +211,9 @@ const trace = {
                 type: 'exit',
                 t: Date.now(),
                 fn: baseMeta.fn,
-                file: baseMeta.file,
-                line: baseMeta.line,
+                file: spanInfo.file !== null && spanInfo.file !== undefined ? spanInfo.file : baseMeta.file,
+                line: spanInfo.line !== null && spanInfo.line !== undefined ? spanInfo.line : baseMeta.line,
+                sourceFile: spanInfo.sourceFile !== null && spanInfo.sourceFile !== undefined ? spanInfo.sourceFile : baseMeta.sourceFile,
                 functionType: baseMeta.functionType || null,
                 traceId: traceIdAtExit,
                 depth: spanInfo.depth ?? depthAtExit,
@@ -545,7 +569,13 @@ if (!global.__repro_call) {
                         const perCallStore = cloneStore(baseStoreSnapshot);
                         let result;
                         als.run(perCallStore, () => {
-                            result = arg.apply(this, arguments);
+                            // Support both callbacks and constructors: some libraries (e.g., class-transformer)
+                            // pass class constructors as args and invoke them with `new`.
+                            if (new.target) {
+                                result = Reflect.construct(arg, arguments, arg);
+                            } else {
+                                result = arg.apply(this, arguments);
+                            }
                         });
                         return result;
                     };
@@ -595,10 +625,14 @@ if (!global.__repro_call) {
                     const name = (label && label.length) || fn.name
                         ? (label && label.length ? label : fn.name)
                         : '(anonymous)';
-                    const sourceFile = fn[SYM_SRC_FILE];
+                    const definitionFile = fn[SYM_SRC_FILE];
+                    const normalizedCallFile = callFile ? String(callFile).trim() : '';
+                    const callsiteFile = normalizedCallFile ? normalizedCallFile : null;
+                    const callsiteLine = Number.isFinite(Number(callLine)) && Number(callLine) > 0 ? Number(callLine) : null;
                     const meta = {
-                        file: sourceFile || callFile || null,
-                        line: sourceFile ? null : (callLine || null),
+                        file: callsiteFile || definitionFile || null,
+                        line: callsiteLine,
+                        sourceFile: definitionFile || null,
                         parentSpanId: forcedParentSpanId
                     };
 
@@ -632,7 +666,7 @@ if (!global.__repro_call) {
                         })();
 
                         const runExit = (detail) => {
-                            const runner = () => trace.exit({ fn: name, file: meta.file, line: meta.line }, detail);
+                            const runner = () => trace.exit({ fn: name, file: meta.file, line: meta.line, sourceFile: meta.sourceFile }, detail);
                             if (exitStore) return als.run(exitStore, runner);
                             return runner();
                         };
@@ -679,7 +713,7 @@ if (!global.__repro_call) {
                         runExit(exitDetailBase);
                         return out;
                     } catch (e) {
-                        trace.exit({ fn: name, file: meta.file, line: meta.line }, { threw: true, error: e, args });
+                        trace.exit({ fn: name, file: meta.file, line: meta.line, sourceFile: meta.sourceFile }, { threw: true, error: e, args });
                         throw e;
                     } finally {
                         if (pendingMarker) {
@@ -707,14 +741,22 @@ if (!global.__repro_call) {
                         const isolatedStore = isUnawaitedCall
                             ? (forkAlsStoreForUnawaited(callStoreForArgs || ctx) || cloneStore(callStoreForArgs || ctx))
                             : null;
-                        try {
-                            const shouldWrap = !isAsyncLocalContextSetter(fn, thisArg);
-                            const argsForCall = shouldWrap ? wrapArgsWithStore(args, callStoreForArgs || ctx) : args;
-                            let out;
-                            if (isolatedStore) {
-                                als.run(isolatedStore, () => {
-                                    out = fn.apply(thisArg, argsForCall);
-                                });
+	                        try {
+	                            const shouldWrap = !isAsyncLocalContextSetter(fn, thisArg);
+	                            const argsForCall = shouldWrap ? wrapArgsWithStore(args, callStoreForArgs || ctx) : args;
+	                            const normalizedCallFile = callFile ? String(callFile).trim() : '';
+	                            const callsiteFile = normalizedCallFile ? normalizedCallFile : null;
+	                            const callsiteLine = Number.isFinite(Number(callLine)) && Number(callLine) > 0 ? Number(callLine) : null;
+	                            const callsiteStore = isolatedStore || ctx;
+	                            if (callsiteStore && (callsiteFile || callsiteLine !== null)) {
+	                                const queue = callsiteStore.__repro_callsite_queue || (callsiteStore.__repro_callsite_queue = []);
+	                                queue.push({ file: callsiteFile, line: callsiteLine });
+	                            }
+	                            let out;
+	                            if (isolatedStore) {
+	                                als.run(isolatedStore, () => {
+	                                    out = fn.apply(thisArg, argsForCall);
+	                                });
                             } else {
                                 out = fn.apply(thisArg, argsForCall);
                             }
@@ -841,6 +883,32 @@ function getCurrentTraceId() {
     return s && s.traceId || null;
 }
 
+function getCurrentSpanContext() {
+    try {
+        const store = als.getStore();
+        if (!store) return null;
+
+        const stack = Array.isArray(store.__repro_span_stack) ? store.__repro_span_stack : [];
+        const top = stack.length ? stack[stack.length - 1] : null;
+        const spanId = top && top.id != null ? top.id : null;
+        const parentSpanId = top && top.parentId != null
+            ? top.parentId
+            : (stack.length >= 2 ? (stack[stack.length - 2]?.id ?? null) : null);
+        const depth = top && top.depth != null
+            ? top.depth
+            : (typeof store.depth === 'number'
+                ? store.depth
+                : (stack.length ? stack.length : null));
+
+        const traceId = store.traceId || null;
+
+        if (spanId === null && parentSpanId === null && traceId === null) return null;
+        return { traceId, spanId, parentSpanId, depth: depth == null ? null : depth };
+    } catch {
+        return null;
+    }
+}
+
 // ---- Promise propagation fallback: ensure continuations run with the captured store ----
 let PROMISE_PATCHED = false;
 function patchPromise() {
@@ -885,6 +953,7 @@ module.exports = {
     printV8,
     patchConsole,
     getCurrentTraceId,
+    getCurrentSpanContext,
     setFunctionLogsEnabled,
     // export symbols so the require hook can tag function origins
     SYM_SRC_FILE,

@@ -9,6 +9,7 @@ const {
     printV8,
     patchConsole,
     getCurrentTraceId,
+    getCurrentSpanContext,
     setFunctionLogsEnabled
 } = require('./runtime');
 const { installCJS } = require('./cjs-hook');
@@ -60,6 +61,7 @@ function api(){
         tracer: trace,
         withTrace: trace.withTrace,
         getCurrentTraceId,
+        getCurrentSpanContext,
         setFunctionLogsEnabled,
     };
 }
