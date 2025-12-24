@@ -1123,7 +1123,7 @@ function resolveCollectionOrWarn(source: any, type: 'doc' | 'query'): string {
 }
 
 async function post(
-    cfg: { tenantId: string; appId: string; appSecret: string; apiBase?: string },
+    cfg: { appId: string; appSecret: string; apiBase?: string },
     sessionId: string,
     body: any,
 ) {
@@ -1137,7 +1137,6 @@ async function post(
                 'Content-Type': 'application/json',
                 'X-App-Id': cfg.appId,
                 'X-App-Secret': cfg.appSecret,
-                'X-Tenant-Id': cfg.tenantId,
             },
             body: JSON.stringify(body),
         });
@@ -1784,7 +1783,6 @@ function applyMasking(
 // ===================================================================
 export type ReproMiddlewareConfig = {
     appId: string;
-    tenantId: string;
     appSecret: string;
     /** Configure header capture/masking. Defaults to capturing with sensitive headers masked. */
     captureHeaders?: boolean | HeaderCaptureOptions;
@@ -2228,7 +2226,7 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
 //   - ONLY schema middleware (pre/post) for specific ops
 //   - keeps your existing doc-diff hooks
 // ===================================================================
-export function reproMongoosePlugin(cfg: { appId: string; tenantId: string; appSecret: string }) {
+export function reproMongoosePlugin(cfg: { appId: string; appSecret: string }) {
     return function (schema: Schema) {
         // -------- pre/post save (unchanged) --------
         schema.pre('save', { document: true }, async function (next) {
@@ -2723,7 +2721,6 @@ function buildMinimalUpdate(before: any, after: any) {
 // ===================================================================
 export type SendgridPatchConfig = {
     appId: string;
-    tenantId: string;
     appSecret: string;
     resolveContext?: () => { sid?: string; aid?: string } | undefined;
 };

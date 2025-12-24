@@ -8,7 +8,7 @@ export const getCtx = () => als.getStore() || {};
 // If you already export als/getCtx from repro-node, reuse that instead of re-declaring.
 
 async function post(
-    cfg: { tenantId: string; appId: string; appSecret: string; apiBase?: string },
+    cfg: { appId: string; appSecret: string; apiBase?: string },
     sessionId: string,
     body: any,
 ) {
@@ -22,7 +22,6 @@ async function post(
                 'Content-Type': 'application/json',
                 'X-App-Id': cfg.appId,
                 'X-App-Secret': cfg.appSecret,
-                'X-Tenant-Id': cfg.tenantId,
             },
             body: JSON.stringify(body),
         });
@@ -31,7 +30,6 @@ async function post(
 
 export type SendgridPatchConfig = {
     appId: string;
-    tenantId: string;
     appSecret: string;
     // Optional: provide a function to resolve sid/aid if AsyncLocalStorage is not set
     resolveContext?: () => { sid?: string; aid?: string } | undefined;
