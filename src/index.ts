@@ -532,6 +532,28 @@ function shouldDropTraceEvent(event: TraceEventForFilter): boolean {
     return false;
 }
 
+function shouldPropagateUserDisabledFunctionTrace(event: TraceEventForFilter): boolean {
+    const rules = userDisabledFunctionTraceRules;
+    if (!rules || rules.length === 0) return false;
+    for (const rule of rules) {
+        try {
+            if (typeof rule === 'function') {
+                const enterEvent = { ...event, type: 'enter', eventType: 'enter' } as TraceEventForFilter;
+                const exitEvent = { ...event, type: 'exit', eventType: 'exit' } as TraceEventForFilter;
+                if (rule(enterEvent) && rule(exitEvent)) return true;
+            } else if (matchesRule(rule, event)) {
+                const eventTypePattern = rule.eventType ?? rule.event;
+                if (!matchesPattern('enter', eventTypePattern)) continue;
+                if (!matchesPattern('exit', eventTypePattern)) continue;
+                return true;
+            }
+        } catch {
+            // ignore user filter errors
+        }
+    }
+    return false;
+}
+
 export function setDisabledFunctionTraces(rules?: DisableFunctionTraceConfig[] | null) {
     if (!rules || !Array.isArray(rules)) {
         userDisabledFunctionTraceRules = null;
@@ -1977,16 +1999,20 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                             if (ev.threw !== undefined) {
                                 evt.threw = Boolean(ev.threw);
                             }
-                            if (ev.unawaited !== undefined) {
-                                evt.unawaited = ev.unawaited === true;
-                            }
+	                            if (ev.unawaited !== undefined) {
+	                                evt.unawaited = ev.unawaited === true;
+	                            }
 
-                            const dropEvent = shouldDropTraceEvent(candidate);
-                            const spanKey = normalizeSpanId(evt.spanId);
-                            if (evt.type === 'enter') {
-                                lastEventAt = Date.now();
-                                if (spanKey) {
-                                    activeSpans.add(spanKey);
+	                            const dropEvent = shouldDropTraceEvent(candidate);
+	                            const dropSpanTree = shouldPropagateUserDisabledFunctionTrace(candidate);
+	                            const spanKey = normalizeSpanId(evt.spanId);
+	                            const parentSpanKey = normalizeSpanId(evt.parentSpanId);
+	                            const isChildOfExcluded = parentSpanKey ? isExcludedSpanId(parentSpanKey) : false;
+	                            const isExcluded = spanKey ? isExcludedSpanId(spanKey) : false;
+	                            if (evt.type === 'enter') {
+	                                lastEventAt = Date.now();
+	                                if (spanKey) {
+	                                    activeSpans.add(spanKey);
                                 } else {
                                     anonymousSpanDepth = Math.max(0, anonymousSpanDepth + 1);
                                 }
@@ -1996,16 +2022,16 @@ export function reproMiddleware(cfg: ReproMiddlewareConfig) {
                                     activeSpans.delete(spanKey);
                                 } else if (!spanKey && anonymousSpanDepth > 0) {
                                     anonymousSpanDepth = Math.max(0, anonymousSpanDepth - 1);
-                                }
-                            }
+	                                }
+	                            }
 
-                            if (dropEvent) {
-                                if (evt.type === 'enter' && spanKey) {
-                                    try { (getCtx() as Ctx).excludedSpanIds?.add(spanKey); } catch {}
-                                }
-                                if (finished) {
-                                    scheduleIdleFlush();
-                                }
+	                            if (dropEvent || isChildOfExcluded || isExcluded) {
+	                                if (evt.type === 'enter' && spanKey && (dropSpanTree || isChildOfExcluded || isExcluded)) {
+	                                    try { (getCtx() as Ctx).excludedSpanIds?.add(spanKey); } catch {}
+	                                }
+	                                if (finished) {
+	                                    scheduleIdleFlush();
+	                                }
                                 return;
                             }
 
