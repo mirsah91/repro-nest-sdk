@@ -38,6 +38,7 @@ import {
 
 const reproConfig = {
   appId: process.env.REPRO_APP_ID as string,
+  appName: process.env.REPRO_APP_NAME as string,
   tenantId: process.env.REPRO_TENANT_ID as string,
   appSecret: process.env.REPRO_APP_SECRET as string,
 };
@@ -66,6 +67,7 @@ bootstrap();
 
 Configuration notes:
 - `REPRO_API_BASE` (optional) overrides the backend base URL used to send data.
+- `REPRO_APP_NAME` (optional) sets `appName`, which is sent as `X-App-Name`.
 
 ### initReproTracing
 
@@ -152,6 +154,7 @@ include `x-bug-session-id` and `x-bug-action-id` headers to be captured.
 
 Options (type -> purpose):
 - `appId` (string): Repro app id.
+- `appName` (string, optional): Repro app name (sent as `X-App-Name`).
 - `tenantId` (string): Repro tenant id.
 - `appSecret` (string): Repro app secret.
 - `captureHeaders` (boolean | HeaderCaptureOptions): enable/disable header capture
@@ -193,6 +196,7 @@ import { reproMiddleware } from 'repro-nest';
 
 app.use(reproMiddleware({
   appId: process.env.REPRO_APP_ID as string,
+  appName: process.env.REPRO_APP_NAME as string,
   tenantId: process.env.REPRO_TENANT_ID as string,
   appSecret: process.env.REPRO_APP_SECRET as string,
   captureHeaders: {
@@ -254,6 +258,7 @@ document diffs. It emits data only when a Repro session is active (i.e., when
 
 Arguments:
 - `appId` (string): Repro app id
+- `appName` (string, optional): Repro app name (sent as `X-App-Name`)
 - `tenantId` (string): Repro tenant id
 - `appSecret` (string): Repro app secret
 
@@ -265,6 +270,7 @@ import { reproMongoosePlugin } from 'repro-nest';
 
 mongoose.plugin(reproMongoosePlugin({
   appId: process.env.REPRO_APP_ID as string,
+  appName: process.env.REPRO_APP_NAME as string,
   tenantId: process.env.REPRO_TENANT_ID as string,
   appSecret: process.env.REPRO_APP_SECRET as string,
 }));
@@ -280,6 +286,7 @@ MongooseModule.forRoot(process.env.MONGO_URL as string, {
   connectionFactory: (connection) => {
     connection.plugin(reproMongoosePlugin({
       appId: process.env.REPRO_APP_ID as string,
+      appName: process.env.REPRO_APP_NAME as string,
       tenantId: process.env.REPRO_TENANT_ID as string,
       appSecret: process.env.REPRO_APP_SECRET as string,
     }));
@@ -297,6 +304,7 @@ import { reproMongoosePlugin } from 'repro-nest';
 const userSchema = new Schema({ email: String });
 userSchema.plugin(reproMongoosePlugin({
   appId: process.env.REPRO_APP_ID as string,
+  appName: process.env.REPRO_APP_NAME as string,
   tenantId: process.env.REPRO_TENANT_ID as string,
   appSecret: process.env.REPRO_APP_SECRET as string,
 }));
