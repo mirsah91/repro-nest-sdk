@@ -105,6 +105,7 @@ import { reproMiddleware } from 'repro-nest';
 
 app.use(reproMiddleware({
   appId,
+  appName,
   appSecret,
   masking: {
     rules: [
